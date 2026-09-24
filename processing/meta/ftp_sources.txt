@@ -1,0 +1,2 @@
+host	username	password	remote_dir	comment
+ftp.data_location.com	crns	example_password		Main server

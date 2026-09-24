@@ -1,0 +1,2 @@
+url	dest	description
+https://data.example.com/api/get-data/12345/your_api_token	data/my_sensor/20240101_now/ftp/api_download.txt	Example Finapp sensor download

@@ -1,0 +1,40 @@
+[project]
+name = "data_champ"
+version = "1.0.0"
+description = "Automated pipeline for syncing, merging, and processing Cosmic-Ray Neutron Sensor (CRNS) data into a unified, analysis-ready format."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Merlin Schiel", email = "schiel@uni-potsdam.de"},
+]
+keywords = ["CRNS", "cosmic-ray neutron sensing", "soil moisture", "hydrology"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Hydrology",
+    "License :: OSI Approved :: MIT License",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "folium>=0.14,<1.0",
+    "matplotlib>=3.5,<4.0",
+    "neptoon>=0.14.0",
+    "openpyxl>=3.1,<4.0",
+    "pandas>=2.0,<3.0",
+    "python-dotenv>=1.0,<2.0",
+    "pyyaml>=6.0,<7.0",
+    "requests>=2.28,<3.0",
+    "streamlit>=1.35,<2.0",
+    "plotly>=5.18,<6.0",
+    "kaleido>=0.2.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["processing"]
+
+[project.urls]
+Repository = "https://github.com/merlinschiel/data_champ"
+

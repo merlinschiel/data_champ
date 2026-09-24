@@ -1,0 +1,58 @@
+config: process
+process_config_hash: null
+correction_hash: null
+force_correction_hash: null
+neutron_quality_assessment:
+  raw_neutrons:
+    flag_range:
+      min: 500
+      max: 6000
+    spike_zscore:
+      periods_in_calculation: 216
+      threshold: 2.5
+      centered: true
+  corrected_neutrons:
+    greater_than_N0:
+      percent_maximum: 1.075
+    below_N0_factor:
+      percent_minimum: 0.485
+correction_steps:
+  air_humidity:
+    method: rosolem_2013
+    omega: 0.0054
+    humidity_ref: 0
+  air_pressure:
+    method: tirado_bueno_2021
+  incoming_radiation:
+    method: zreda_2012
+    reference_neutron_monitor:
+      station: JUNG
+      resolution: 60
+      nmdb_table: revori
+  above_ground_biomass:
+    method: baatz_2015
+    biomass_units: kg/m^2
+  soil_moisture_estimation:
+    method: desilets_etal_2010
+    koehli_etal_2021_parameterset: Mar21_mcnp_drf
+    N0_includes_hydrogen_pools: false 
+    N0_estimation: local #general or local
+data_smoothing:
+  smooth_corrected_neutrons: false
+  smooth_soil_moisture: false
+  settings:
+    algorithm: rolling_mean
+    window: 3h
+    min_proportion_good_data: 0.7
+temporal_aggregation:
+  aggregate_data: true
+  output_resolution: 24h
+  align_timestamps: true
+  alignment_method: time
+  alignment_resolution: inferred
+  max_alignment_gap_hours: 3.0
+  aggregate_method: bagg
+  aggregate_func: mean
+  aggregate_maxna_fraction: 0.5
+
+
