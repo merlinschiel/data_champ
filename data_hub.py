@@ -1,7 +1,15 @@
 """
 CRNS Data Hub — Central User Interface
 =======================================
-Streamlit-based hub for CRNS Data Harmonization.
+Streamlit-based hub for the CRNS Data Harmonization project.
+Replaces the old manual_append.py tkinter UI.
+
+Features:
+  - One-click execution of all pipeline steps (sync, merge, process, calibrate, reports, dashboard)
+  - Interactive data visualization with Plotly (merged & processed CSVs)
+  - Column selection, date range filtering, and plot export (PNG, HTML)
+  - Live log output with st.status for running tasks
+
 Launch:
   streamlit run data_hub.py
 """
@@ -527,7 +535,7 @@ elif page == "Pipeline":
 
     with st.container(horizontal=True):
         enable_field = st.checkbox("Enable field/SD card sync", value=False)
-        force_rerun = st.checkbox("Force re-sync (bypass cache)", value=False)
+        force_rerun = st.checkbox("Force re-sync / re-merge (bypass caches)", value=False)
         by_phase = st.checkbox("Process phase-by-phase", value=False)
 
     st.divider()
@@ -601,6 +609,8 @@ elif page == "Pipeline":
                 cmd += ["--sensor"] + [
                     s for s in selected_sensors if s != "All sensors"
                 ]
+            if force_rerun:
+                cmd += ["--force"]
             run_step_with_status("Data merge", cmd, console_slot)
 
         # --- Custom merging (group-merge with advanced options) ---

@@ -1,0 +1,17 @@
+# Normalize line endings: store LF in the repo and check out LF everywhere,
+# so dev, production and data_champ compare cleanly regardless of OS/settings.
+* text=auto eol=lf
+
+# Windows batch files need CRLF to run reliably
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files: never touch line endings, never try to text-diff
+*.xlsx binary
+*.xls binary
+*.png binary
+*.jpg binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.pkl binary

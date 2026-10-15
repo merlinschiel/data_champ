@@ -1,13 +1,13 @@
 import os
-import glob
-import json
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import warnings
 import yaml
 from pathlib import Path
+
+from sensor_metadata import METADATA_FILE, load_sensors_from_excel, sensor_name
 
 warnings.filterwarnings("ignore")
 
@@ -25,6 +25,12 @@ CB_BLUE = '#0072B2'      # Running/Active
 CB_ORANGE = '#E69F00'    # Warning
 CB_VERMILLION = '#D55E00' # Stale/No Data
 
+
+def _utc_now():
+    """Current time as naive UTC, matching the (UTC) timestamps of the merged data."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 class SensorAnalyzer:
     def __init__(self, name, csv_path, yaml_config, location='Unknown'):
         self.name = name
@@ -40,7 +46,7 @@ class SensorAnalyzer:
             return False
 
         try:
-            temp_df = pd.read_csv(self.csv_path, sep=',', engine='python')
+            temp_df = pd.read_csv(self.csv_path, sep=',', low_memory=False)
             if temp_df.empty:
                 print(f"[{self.name}] SKIPPED: Data file is empty.")
                 return False
@@ -51,7 +57,7 @@ class SensorAnalyzer:
                 if temp_dt.dt.tz is not None:
                     temp_dt = temp_dt.dt.tz_localize(None)
                 
-                cutoff_date = datetime.now() - timedelta(days=DAYS_TO_SEARCH)
+                cutoff_date = _utc_now() - timedelta(days=DAYS_TO_SEARCH)
                 recent_df = temp_df[temp_dt >= cutoff_date]
                 
                 if not recent_df.empty:
@@ -134,7 +140,7 @@ class SensorAnalyzer:
             last_time = last_time.tz_localize(None)
             
         # Check if data is older than 48 hours (172800 seconds)
-        is_stale = (datetime.now() - last_time).total_seconds() > 172800 
+        is_stale = (_utc_now() - last_time).total_seconds() > 172800
         
         status_text = f"STALE (Last: {last_time})" if is_stale else f"RUNNING (Last: {last_time})"
         
@@ -544,61 +550,37 @@ def generate_dashboard_html(sensor_results):
         f.write(html_content)
     print(f"--- Dashboard generated: {html_path} ---")
 
-def load_active_sensors_excel():
-    active_map = {}
-    meta_xlsx = PROCESSING_DIR / "meta" / "sensor_metadata.xlsx"
-    if meta_xlsx.exists():
-        try:
-            xls = pd.ExcelFile(meta_xlsx)
-            for sheet in xls.sheet_names:
-                if sheet.lower() == "config_meta":
-                    continue
-                df = pd.read_excel(xls, sheet_name=sheet)
-                if "Active" in df.columns and len(df) > 0:
-                    val = df["Active"].iloc[0]
-                    if isinstance(val, str):
-                        is_act = val.strip().lower() in ("true", "1", "yes")
-                    else:
-                        is_act = bool(val)
-                    active_map[str(sheet)] = is_act
-        except Exception as e:
-            print(f"Warning loading metadata xlsx: {e}")
-    return active_map
-
 def main():
+    """Build the dashboard for all active sensors in sensor_metadata.xlsx."""
     print("--- Starting Sensor Performance Analysis ---")
     dashboard_data = []
-    active_map = load_active_sensors_excel()
 
-    if not os.path.exists(SENSOR_CONFIG_DIR):
-        print(f"Error: Sensor configuration directory not found at {SENSOR_CONFIG_DIR}")
-    else:
-        yaml_files = glob.glob(os.path.join(SENSOR_CONFIG_DIR, "*.yaml"))
-        for yaml_file in yaml_files:
-            try:
-                with open(yaml_file, 'r', encoding='utf-8') as f:
-                    config = yaml.safe_load(f)
+    sensors = load_sensors_from_excel(METADATA_FILE)
+    for sensor_key, sensor_data in sensors.items():
+        if not sensor_data.get('active', False):
+            print(f"[{sensor_key}] SKIPPED: Inactive sensor.")
+            continue
+        name = sensor_name(sensor_key, sensor_data)
+        yaml_file = SENSOR_CONFIG_DIR / f"sensor_{name}_master.yaml"
+        if not yaml_file.exists():
+            print(f"[{name}] SKIPPED: no master config ({yaml_file.name}); run the merge first.")
+            continue
+        try:
+            with open(yaml_file, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f) or {}
+            sensor_location = str(config.get('sensor_info', {}).get('location', 'Unknown'))
+            csv_path = os.path.join(BASE_MERGED_DIR, f"merged_{name}.csv")
 
-                sensor_name = str(config.get('sensor_info', {}).get('name', 'Unknown'))
-                sensor_location = str(config.get('sensor_info', {}).get('location', 'Unknown'))
+            analyzer = SensorAnalyzer(name, csv_path, config, sensor_location)
+            if analyzer.load_data():
+                analyzer.process_data()
+                result = analyzer.generate_report()
+                if result:
+                    dashboard_data.append(result)
+        except Exception as e:
+            print(f"Error processing {yaml_file}: {e}")
 
-                if not active_map.get(sensor_name, True):
-                    print(f"[{sensor_name}] SKIPPED: Inactive sensor.")
-                    continue
-
-                csv_filename = f"merged_{sensor_name}.csv"
-                csv_path = os.path.join(BASE_MERGED_DIR, csv_filename)
-
-                analyzer = SensorAnalyzer(sensor_name, csv_path, config, sensor_location)
-                if analyzer.load_data():
-                    analyzer.process_data()
-                    result = analyzer.generate_report()
-                    if result:
-                        dashboard_data.append(result)
-            except Exception as e:
-                print(f"Error processing {yaml_file}: {e}")
-
-        generate_dashboard_html(dashboard_data)
+    generate_dashboard_html(dashboard_data)
 
 if __name__ == "__main__":
     main()

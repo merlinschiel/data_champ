@@ -2,26 +2,50 @@
 Plots and Reports Generation for CRNS Harmonization Pipeline
 ============================================================
 Handles automatic visualization and report generation:
-  1. Full-timeseries Neptoon PNG figures.
-  2. Neptoon PDF Report.
-  3. Calibration diagnostic plots.
+  1. Full-timeseries Neptoon PNG figures (neutrons, corrections, soil moisture + uncertainty, meteo, NMDB).
+  2. Neptoon PDF Report using Magazine/Publish.
+  3. Calibration diagnostic plots (CRNS vs in-situ weighted fit, sample depth/radial profiles).
+
+Usage (regenerate figures from data/.processed/processed_<sensor>.csv):
+  python processing/plots_and_reports.py --sensor 01
 """
 
-import os
-import sys
+import argparse
 import shutil
 import logging
+from datetime import date, datetime
 from pathlib import Path
 from typing import Union, Optional, List, Dict
 
-import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 
 logger = logging.getLogger("pipeline_plots")
+
+# neptoon >= 1.2 column names (older outputs used the long names)
+SM_VOL_COLUMNS = ("smv", "soil_moisture_volumetric")
+SM_GRAV_COLUMNS = ("smg", "soil_moisture_gravimetric")
+
+
+def _first_column(df: pd.DataFrame, candidates) -> Optional[str]:
+    return next((c for c in candidates if c in df.columns), None)
+
+
+def _sensor_info(sensor_info_dict: Optional[Dict], df: pd.DataFrame, sensor_name: str):
+    """Build a neptoon SensorInfo from YAML sensor_info, preferring values neptoon wrote into df."""
+    from neptoon.config.models.common import SensorInfo
+
+    data = {k: v for k, v in (sensor_info_dict or {}).items()
+            if k in SensorInfo.model_fields and v is not None}
+    if isinstance(data.get("install_date"), date) and not isinstance(data["install_date"], datetime):
+        data["install_date"] = datetime.combine(data["install_date"], datetime.min.time())
+    data["name"] = str(data.get("name", sensor_name))
+    for col in ("latitude", "longitude", "elevation", "N0"):
+        if col in df.columns and df[col].notna().any():
+            data[col] = float(df[col].dropna().iloc[-1])
+    return SensorInfo(**data)
 
 
 def generate_neptoon_figures(
@@ -31,20 +55,20 @@ def generate_neptoon_figures(
     sensor_info_dict: Optional[Dict] = None,
     create_pdf_report: bool = True,
 ) -> List[Path]:
-    """Generate and save full-timeseries Neptoon figures and PDF report using native Neptoon CRNSDataHub.
+    """Generate full-timeseries neptoon figures (PNG) and the PDF report for a processed series.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Processed concatenated timeseries DataFrame with datetime index.
+        Processed time series (neptoon output) with a DatetimeIndex.
     sensor_name : str
-        Sensor identifier/name (e.g. '01').
+        Sensor name (e.g. '01').
     output_dir : str or Path
-        Target directory to save figures (e.g. data/.processed/figures/01).
+        Target directory (e.g. data/.processed/figures/01).
     sensor_info_dict : dict, optional
-        Metadata dict for SensorInfo (lat, lon, elevation, N0, etc.).
+        sensor_info block of the sensor YAML (location, N0, ...).
     create_pdf_report : bool
-        Whether to generate Report-<sensor_name>.pdf.
+        Whether to also produce neptoon's PDF report.
 
     Returns
     -------
@@ -53,96 +77,53 @@ def generate_neptoon_figures(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    generated_files = []
 
     if df is None or df.empty:
         logger.warning(f"[{sensor_name}] Cannot generate figures: DataFrame is empty.")
-        return generated_files
+        return []
 
-    # Ensure DatetimeIndex
     if not isinstance(df.index, pd.DatetimeIndex):
-        for col in ['DateTime', 'DateTime_utc', 'date_time', 'time']:
+        for col in ['Date_Time', 'DateTime', 'DateTime_utc', 'date_time', 'time']:
             if col in df.columns:
-                df = df.set_index(pd.to_datetime(df[col], utc=True))
+                df = df.set_index(pd.to_datetime(df[col], utc=True)).drop(columns=[col])
                 break
 
     from magazine import Magazine
+    from neptoon.config.models.output import DataStorageConfig
     from neptoon.hub.crns_data_hub import CRNSDataHub
-    from neptoon.config.configuration_input import SensorInfo
+    from neptoon.runtime import ProcessingContext
 
-    Magazine.active = True
     Magazine.clean()
-
-    # Extract sensor metadata — prefer sensor_info_dict (from YAML config), fallback to DataFrame columns
-    lat = 0.0
-    lon = 0.0
-    elev = 0.0
-    n0_val = 1000.0
-
-    if sensor_info_dict:
-        lat = float(sensor_info_dict.get('latitude', lat))
-        lon = float(sensor_info_dict.get('longitude', lon))
-        elev = float(sensor_info_dict.get('elevation', elev))
-        n0_val = float(sensor_info_dict.get('N0', n0_val))
-
-    # Override from DataFrame if available
-    if 'latitude' in df.columns and not df['latitude'].dropna().empty:
-        lat = float(df['latitude'].dropna().iloc[0])
-    if 'longitude' in df.columns and not df['longitude'].dropna().empty:
-        lon = float(df['longitude'].dropna().iloc[0])
-    if 'elevation' in df.columns and not df['elevation'].dropna().empty:
-        elev = float(df['elevation'].dropna().iloc[0])
-    if 'N0' in df.columns and not df['N0'].dropna().empty:
-        n0_val = float(df['N0'].dropna().iloc[0])
-
-    s_info = SensorInfo(
-        name=str(sensor_info_dict.get('name', sensor_name) if sensor_info_dict else sensor_name),
-        identifier=str(sensor_info_dict.get('identifier', sensor_name) if sensor_info_dict else sensor_name),
-        country=str(sensor_info_dict.get('country', '') if sensor_info_dict else ''),
-        install_date=str(sensor_info_dict.get('install_date', '2019-01-01') if sensor_info_dict else '2019-01-01'),
-        time_zone=int(sensor_info_dict.get('time_zone', 0) if sensor_info_dict else 0),
-        latitude=lat,
-        longitude=lon,
-        elevation=elev,
-        N0=n0_val,
-    )
 
     hub = CRNSDataHub(
         crns_data_frame=df,
-        sensor_info=s_info,
+        sensor_info=_sensor_info(sensor_info_dict, df, sensor_name),
+        data_storage=DataStorageConfig(create_report=bool(create_pdf_report)),
+        processing_context=ProcessingContext(report_enabled=bool(create_pdf_report)),
     )
-
-    if 'soil_moisture_volumetric' not in df.columns or df['soil_moisture_volumetric'].isna().all():
-        hub.produce_soil_moisture_estimates()
-
     hub.create_figures(create_all=True)
-    hub.flags_data_frame = pd.DataFrame(index=df.index)
 
-    # Save via Neptoon SaveAndArchiveOutputs
-    nep_sub = output_dir / f"{sensor_name}_"
-    if nep_sub.exists():
-        shutil.rmtree(nep_sub, ignore_errors=True)
-    hub.save_data(save_folder_location=output_dir, append_timestamp=False)
+    # neptoon writes data, flags, figures and the report into one folder; keep only figures/report
+    staging_name = f"_{sensor_name}_neptoon_output"
 
-    # Move only figures (PNG) and report (PDF) to output_dir root
-    for item in output_dir.rglob('*'):
-        if item.is_file() and item.parent != output_dir:
-            if item.suffix.lower() in ['.png', '.pdf']:
+    def _staging_dirs():
+        return [p for p in output_dir.glob(f"{staging_name}*") if p.is_dir()]
+
+    for old in _staging_dirs():
+        shutil.rmtree(old, ignore_errors=True)
+    hub.save_data(folder_name=staging_name, save_folder_location=output_dir, append_timestamp=False)
+
+    generated = []
+    for staging in _staging_dirs():
+        for item in staging.rglob('*'):
+            if item.is_file() and item.suffix.lower() in ('.png', '.pdf'):
                 dest = output_dir / item.name
-                if not dest.exists() or dest.stat().st_size != item.stat().st_size:
-                    shutil.copy2(item, dest)
-                generated_files.append(dest)
-        elif item.is_file() and item.suffix.lower() in ['.png', '.pdf']:
-            generated_files.append(item)
+                shutil.copy2(item, dest)
+                generated.append(dest)
+        shutil.rmtree(staging, ignore_errors=True)
 
-    # Clean up subdirectories created by neptoon saver
-    for sub in list(output_dir.glob(f"{sensor_name}*")):
-        if sub.is_dir():
-            shutil.rmtree(sub, ignore_errors=True)
-
-    generated_files = list(set(generated_files))
-    logger.info(f"[{sensor_name}] Generated {len(generated_files)} Neptoon figures & reports in {output_dir}")
-    return generated_files
+    logger.info(f"[{sensor_name}] Generated {len(generated)} neptoon figures & reports in {output_dir}")
+    return generated
 
 
 def generate_calibration_plots(
@@ -193,10 +174,10 @@ def generate_calibration_plots(
     calib_days = pd.to_datetime(results_df['calibration_day']).tolist()
     opt_n0 = report_dict.get('optimal_N0', 'N/A')
     method = report_dict.get('method', 'desilets_etal_2010')
-    site_props = report_dict.get('site_properties', {})
-    bd = site_props.get('dry_soil_bulk_density_g_cm3', 0.0)
-    soc = site_props.get('soil_organic_carbon_g_g', 0.0)
-    lw = site_props.get('lattice_water_g_g', 0.0)
+    site_props = report_dict.get('sample_averages') or {}
+    bd = site_props.get('avg_dry_soil_bulk_density', 0.0)
+    soc = site_props.get('avg_soil_organic_carbon', 0.0)
+    lw = site_props.get('avg_lattice_water', 0.0)
 
     # -----------------------------------------------------------------------
     # 1. Calibration Fit Overview Plot
@@ -228,6 +209,7 @@ def generate_calibration_plots(
     ax1.legend(loc='upper right', frameon=True, fontsize=9)
 
     # Subplot 2: CRNS Soil Moisture vs In-situ Sample Average
+    sm_col = _first_column(ts_df, SM_VOL_COLUMNS)
     for i, c_day in enumerate(calib_days):
         color = colors[i % len(colors)]
         c_str = str(c_day.date())
@@ -235,8 +217,8 @@ def generate_calibration_plots(
         win_end = c_day + pd.Timedelta(days=7)
         sub = ts_df.loc[(ts_df.index >= win_start) & (ts_df.index <= win_end)]
 
-        if not sub.empty and 'soil_moisture_volumetric' in sub.columns:
-            ax2.plot(sub.index, sub['soil_moisture_volumetric'] * 100, color=color, lw=1.4,
+        if not sub.empty and sm_col:
+            ax2.plot(sub.index, sub[sm_col] * 100, color=color, lw=1.4,
                      label=f'CRNS SM ±7d ({c_str})')
 
         # In-situ weighted mean from results_df
@@ -316,3 +298,52 @@ def generate_calibration_plots(
             logger.warning(f"[{sensor_id}] Could not generate sample profiles plot: {e}")
 
     return generated
+
+
+def main():
+    """Regenerate neptoon figures/PDF reports from the processed CSVs."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from log_utils import get_logger
+    from sensor_metadata import (
+        METADATA_FILE, TARGET_DATA_DIR, load_phase_config, load_sensors_from_excel,
+        parse_sensor_filter, phase_windows, sensor_matches, sensor_name,
+    )
+
+    global logger
+    logger = get_logger("plots_and_reports", "plots_and_reports.log")
+
+    parser = argparse.ArgumentParser(description="Generate neptoon figures and PDF reports from processed data.")
+    parser.add_argument("--sensor", "-s", type=str, nargs="+", default=None,
+                        help="Sensor(s) to plot (default: all sensors with processed data)")
+    args, _ = parser.parse_known_args()
+
+    processed_dir = TARGET_DATA_DIR / ".processed"
+    sensor_filter = parse_sensor_filter(args.sensor)
+    failed = []
+    for key, data in load_sensors_from_excel(METADATA_FILE).items():
+        if not sensor_matches(sensor_filter, key, data):
+            continue
+        name = sensor_name(key, data)
+        csv_path = processed_dir / f"processed_{name}.csv"
+        if not csv_path.exists():
+            if sensor_filter:
+                logger.warning(f"[{name}] No processed data at {csv_path}; run neptoon_pipeline.py first.")
+            continue
+        df = pd.read_csv(csv_path)
+        df = df.set_index(pd.to_datetime(df.pop("Date_Time"), utc=True)).drop(columns=["phase"], errors="ignore")
+        windows = phase_windows(data.get("phase", []))
+        latest_cfg = next((load_phase_config(w["config_file"]) for w in reversed(windows)
+                           if load_phase_config(w["config_file"])), {}) or {}
+        try:
+            generate_neptoon_figures(df, name, processed_dir / "figures" / name,
+                                     sensor_info_dict=latest_cfg.get("sensor_info", {}))
+        except Exception as e:
+            logger.error(f"[{name}] Figure generation failed: {e}")
+            failed.append(name)
+    if failed:
+        raise SystemExit(f"Figure generation failed for: {failed}")
+
+
+if __name__ == "__main__":
+    main()

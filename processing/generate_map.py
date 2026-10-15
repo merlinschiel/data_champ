@@ -15,13 +15,20 @@ def generate_map():
     df = pd.read_excel(METADATA_FILE, sheet_name="Locations")
     df.columns = df.columns.str.strip()
 
+    # Base map using CartoDB Positron (does not block local file:// or lack of Referer)
     m = folium.Map(
         location=[51.1657, 10.4515],
         zoom_start=6,
         control_scale=True,
-        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        tiles="CartoDB positron",
+        name="Light Map",
     )
+    folium.TileLayer("CartoDB voyager", name="Voyager").add_to(m)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri",
+        name="Satellite",
+    ).add_to(m)
 
     valid_coords = []
 
@@ -59,6 +66,8 @@ def generate_map():
 
     if valid_coords:
         m.fit_bounds(valid_coords)
+
+    folium.LayerControl().add_to(m)
 
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     m.save(str(OUTPUT_FILE))

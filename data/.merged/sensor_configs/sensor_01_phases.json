@@ -1,0 +1,105 @@
+{
+  "sensor": "01",
+  "metadata_sheet": "01",
+  "phases": [
+    {
+      "phase_id": "phase1",
+      "start": "2018-12-01T00:00:00+00:00",
+      "end": "2019-05-08T00:00:00+00:00",
+      "folder_name": "20181201_20190508",
+      "config_file": null,
+      "location": null,
+      "description": null
+    },
+    {
+      "phase_id": "phase2",
+      "start": "2019-05-08T00:00:00+00:00",
+      "end": "2019-06-06T00:00:00+00:00",
+      "folder_name": "20190508_20190606",
+      "config_file": null,
+      "location": null,
+      "description": "phase 2"
+    },
+    {
+      "phase_id": "phase3",
+      "start": "2019-06-06T00:00:00+00:00",
+      "end": "2019-07-15T00:00:00+00:00",
+      "folder_name": "20190606_20190715",
+      "config_file": null,
+      "location": null,
+      "description": "phase 3"
+    },
+    {
+      "phase_id": "phase4",
+      "start": "2019-07-15T00:00:00+00:00",
+      "end": "2020-04-15T09:00:00+00:00",
+      "folder_name": "20190715_20200415",
+      "config_file": "01/sensor_01_10col.yaml",
+      "location": "MQ1",
+      "description": "first installation"
+    },
+    {
+      "phase_id": "phase5",
+      "start": "2020-04-15T09:00:00+00:00",
+      "end": "2021-01-28T00:00:00+00:00",
+      "folder_name": "20200415_20210127",
+      "config_file": "01/sensor_01_15col.yaml",
+      "location": "MQ1",
+      "description": "pr2/4 installed"
+    },
+    {
+      "phase_id": "phase6",
+      "start": "2021-10-27T09:00:00+00:00",
+      "end": "2021-11-16T09:00:00+00:00",
+      "folder_name": "20211027_20211116",
+      "config_file": "01/sensor_01_15col.yaml",
+      "location": "MQ1",
+      "description": "tube removed"
+    },
+    {
+      "phase_id": "phase7",
+      "start": "2021-11-16T09:00:00+00:00",
+      "end": "2022-06-14T12:00:00+00:00",
+      "folder_name": "20211116_20220614",
+      "config_file": "01/sensor_01_15col.yaml",
+      "location": "MQ1",
+      "description": "tube reinstalled"
+    },
+    {
+      "phase_id": "phase8",
+      "start": "2022-06-14T12:00:00+00:00",
+      "end": "2022-09-23T15:00:00+00:00",
+      "folder_name": "20220614_20220923",
+      "config_file": "01/sensor_01_15col.yaml",
+      "location": "MQ1",
+      "description": "tube removed"
+    },
+    {
+      "phase_id": "phase9",
+      "start": "2022-09-23T15:00:00+00:00",
+      "end": "2023-09-08T09:00:00+00:00",
+      "folder_name": "20220923_20230908",
+      "config_file": "01/sensor_01_15col.yaml",
+      "location": "MQ1",
+      "description": "tube reinstalled"
+    },
+    {
+      "phase_id": "phase10",
+      "start": "2023-09-08T09:00:00+00:00",
+      "end": "2023-12-11T10:00:00+00:00",
+      "folder_name": "20230908_20231211",
+      "config_file": "01/sensor_01_17col.yaml",
+      "location": "MQ1",
+      "description": "pr2/6 installed"
+    },
+    {
+      "phase_id": "phase11",
+      "start": "2023-12-11T10:00:00+00:00",
+      "end": null,
+      "folder_name": "20231211_now",
+      "config_file": "01/sensor_01_29col.yaml",
+      "location": "MQ1",
+      "description": "smt100 installed"
+    }
+  ]
+}

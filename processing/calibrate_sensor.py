@@ -1,232 +1,288 @@
 """
-Sensor Calibration Workflow for Neptoon
-=======================================
+Sensor Calibration Workflow (neptoon >= 1.2)
+============================================
+Calibrates N0 from field campaign samples (gravimetric / FDR) with neptoon's own
+calibration stage (Desilets 2010 / Köhli 2021 conversion, Schrön 2017 weights).
 
-Features:
-- Calibrates N0 using field campaign sample data (gravimetric / FDR)
-- Calculates Schrön et al. (2017) horizontal and vertical spatial weights
-- Extracts footprint radius and weighted field soil moisture
-- Optionally writes calibrated N0 back to sensor YAML configuration files
-- Saves calibration reports and sample weighting tables
+- Calibration samples are matched to phases by their timestamps (phase windows from
+  sensor_metadata.xlsx). Each phase with samples is calibrated separately, using that
+  phase's sensor YAML and the merged time series of that phase, i.e. the same data the
+  processing step uses.
+- Calibration CSV columns are taken from the phase YAML (calibration.key_column_names)
+  when the CSV has them, otherwise from the defaults below.
+- With --update-yaml only the YAML of the calibrated phase is changed: N0 is written,
+  site soil properties (avg_*) are only filled in where the YAML has no value yet.
+- Reports, sample weights and plots go to data/.processed/calibration_results/.
 
 Usage:
   python processing/calibrate_sensor.py --sensor 01
-  python processing/calibrate_sensor.py --sensor 01 --update-yaml
+  python processing/calibrate_sensor.py --sensor 01 02 --update-yaml
   python processing/calibrate_sensor.py --sensor 01 --process-config processing/process_config/hourly_config.yaml
 """
 
-import sys
-import os
-import shutil
 import argparse
 import json
-import logging
+import re
 from pathlib import Path
+
 import pandas as pd
-import numpy as np
 import yaml
 
-os.environ['PYTHONIOENCODING'] = 'utf-8'
-if hasattr(sys.stdout, 'reconfigure'):
-    try:
-        sys.stdout.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
-
-PROCESSING_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = PROCESSING_DIR.parent
-if str(PROCESSING_DIR) not in sys.path:
-    sys.path.insert(0, str(PROCESSING_DIR))
-
-from neptoon.calibration import CalibrationConfiguration, CalibrationStation
-from neptoon.columns import ColumnInfo
-from neptoon.workflow.process_with_config import ProcessWithConfig
-from merge_utils import _patch_yaml_for_neptoon, scan_yaml_files, group_configs_by
-from plots_and_reports import generate_calibration_plots
-
-LOG_DIR = PROCESSING_DIR / "meta" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_DIR / "calibration.log", mode='w', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
+from log_utils import configure_utf8_console, get_logger
+from neptoon_utils import (
+    WORK_DIR,
+    build_neptoon_sensor_config,
+    clean_work_dir,
+    phase_configs,
+    read_merged_csv_text,
+    run_neptoon,
+    write_neptoon_input,
 )
-logger = logging.getLogger("calibrate_sensor")
+from sensor_metadata import (
+    MERGED_DIR,
+    METADATA_FILE,
+    PROCESSING_DIR,
+    PROJECT_ROOT,
+    SENSOR_CONFIG_DIR,
+    assign_phase_ids,
+    load_sensors_from_excel,
+    parse_sensor_filter,
+    read_phase_info,
+    sensor_aliases,
+    sensor_matches,
+    sensor_name,
+)
+
+configure_utf8_console()
+logger = get_logger("calibrate_sensor", "calibration.log")
+
+DEFAULT_PROCESS_CONFIG = PROCESSING_DIR / "process_config" / "default_config.yaml"
+RESULTS_DIR = PROJECT_ROOT / "data" / ".processed" / "calibration_results"
+CALIBRATION_DIRS = [
+    PROJECT_ROOT / "data" / ".calibration",
+    PROJECT_ROOT / "data",
+    PROCESSING_DIR / "calibration" / "data",
+]
+SAMPLE_DT_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# neptoon calibration column key -> default column name in our calibration CSVs
+DEFAULT_CALIBRATION_COLUMNS = {
+    "date_time": "DateTime_utc",
+    "profile_id": "Profile_ID",
+    "radial_distance_from_sensor": "Distance_to_CRNS_m",
+    "sample_depth": "Profile_Depth_cm",
+    "gravimetric_soil_moisture": "SoilMoisture_g_g",
+    "bulk_density_of_sample": "DryBulkDensity_g_cm3",
+    "soil_organic_carbon": "SoilOrganicCarbon_g_g",
+    "lattice_water": "LatticeWater_g_g",
+}
+REQUIRED_CALIBRATION_KEYS = (
+    "date_time", "profile_id", "radial_distance_from_sensor",
+    "sample_depth", "gravimetric_soil_moisture", "bulk_density_of_sample",
+)
+# YAML calibration.key_column_names entries whose name differs from the neptoon key
+YAML_KEY_NAMES = {
+    "profile_id": "profile_id_column",
+}
+SITE_PROPERTY_KEYS = {
+    "avg_dry_soil_bulk_density": "value_avg_bulk_density",
+    "avg_soil_organic_carbon": "value_avg_soil_organic_carbon",
+    "avg_lattice_water": "value_avg_lattice_water",
+}
 
 
-def _load_sensor_config(sensor_id: str) -> dict:
-    """Load sensor YAML config from processing/sensor_config/<sensor_id>/."""
-    cfg_dir = PROCESSING_DIR / "sensor_config" / sensor_id
-    if not cfg_dir.exists() and sensor_id.isdigit():
-        cfg_dir = PROCESSING_DIR / "sensor_config" / f"{int(sensor_id):02d}"
+# ---------------------------------------------------------------------------
+# Inputs
+# ---------------------------------------------------------------------------
 
-    if not cfg_dir.exists():
-        logger.warning(f"Sensor config directory not found: {cfg_dir}")
-        return {}
-
-    yaml_files = sorted(cfg_dir.glob("*.yaml"))
-    if not yaml_files:
-        return {}
-
-    with open(yaml_files[0], 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f) or {}
-
-
-def _load_sm_estimation_settings(process_config_path: Path = None) -> dict:
-    """Extract soil_moisture_estimation settings from process config YAML.
-
-    Returns dict with 'method' and 'koehli_etal_2021_parameterset'.
-    """
-    cfg_path = process_config_path or (PROCESSING_DIR / "process_config" / "default_config.yaml")
-    with open(cfg_path, 'r', encoding='utf-8') as f:
-        proc_cfg = yaml.safe_load(f) or {}
-
-    sm_est = proc_cfg.get('correction_steps', {}).get('soil_moisture_estimation', {})
-    return {
-        'method': sm_est.get('method', 'desilets_etal_2010'),
-        'koehli_params': sm_est.get('koehli_etal_2021_parameterset', 'Mar21_mcnp_drf'),
-    }
+def resolve_sensor(sensor_id: str, sensors: dict) -> tuple[str, dict]:
+    """Find the metadata sensor for an id (sheet name, sensor name or config folder)."""
+    sensor_filter = parse_sensor_filter([sensor_id])
+    matches = [(k, v) for k, v in sensors.items() if sensor_matches(sensor_filter, k, v)]
+    exact = [(k, v) for k, v in matches if k.lower() == str(sensor_id).lower()]
+    if exact:
+        return exact[0]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"Sensor '{sensor_id}' not found in {METADATA_FILE.name}")
+    raise ValueError(f"Sensor '{sensor_id}' is ambiguous: {[k for k, _ in matches]}")
 
 
-def load_calibration_dataset(sensor_id: str, campaign_path: str = None,
-                             required_columns: list = None) -> pd.DataFrame:
-    """Load and validate the calibration dataset for a sensor."""
+def find_calibration_file(sensor_key: str, sensor_data: dict, campaign_path: str = None) -> Path:
     if campaign_path:
-        calib_file = Path(campaign_path)
-    else:
-        candidates = [
-            PROJECT_ROOT / "data" / "calibration" / f"calibration_{sensor_id}.csv",
-            PROJECT_ROOT / "data" / "calibration" / f"calibration_{int(sensor_id):02d}.csv" if sensor_id.isdigit() else None,
-            PROJECT_ROOT / "data" / f"calibration_{sensor_id}.csv",
-            PROCESSING_DIR / "calibration" / "data" / f"calibration_{sensor_id}.csv",
-            PROCESSING_DIR / "calibration" / "data" / f"calibration_{int(sensor_id):02d}.csv" if sensor_id.isdigit() else None,
-        ]
-        calib_file = next((c for c in candidates if c is not None and c.exists()), None)
+        path = Path(campaign_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Calibration file not found: {path}")
+        return path
+    for alias in sorted(sensor_aliases(sensor_key, sensor_data) | {str(sensor_key)}):
+        for candidate_id in {alias, f"{int(alias):02d}" if alias.isdigit() else alias}:
+            for directory in CALIBRATION_DIRS:
+                path = directory / f"calibration_{candidate_id}.csv"
+                if path.exists():
+                    return path
+    raise FileNotFoundError(
+        f"Calibration data not found for sensor '{sensor_key}'. "
+        f"Place it at data/.calibration/calibration_{sensor_key}.csv"
+    )
 
-    if calib_file is None or not calib_file.exists():
-        raise FileNotFoundError(
-            f"Calibration data not found for sensor '{sensor_id}'. Looked in data/calibration/. "
-            f"Please place calibration CSV at data/calibration/calibration_{sensor_id}.csv."
-        )
 
+def _yaml_calibration_names(cfg: dict) -> dict:
+    names = ((cfg or {}).get("calibration") or {}).get("key_column_names") or {}
+    resolved = {}
+    for key in DEFAULT_CALIBRATION_COLUMNS:
+        value = names.get(YAML_KEY_NAMES.get(key, key))
+        if value:
+            resolved[key] = str(value)
+    return resolved
+
+
+def resolve_calibration_columns(cfg: dict, csv_columns) -> tuple[dict, list, list]:
+    """Pick the CSV column for each neptoon calibration key.
+
+    The YAML name is used when the CSV contains it, otherwise the default name.
+    Returns (mapping, notes, missing_required).
+    """
+    yaml_names = _yaml_calibration_names(cfg)
+    csv_columns = set(csv_columns)
+    mapping, notes, missing = {}, [], []
+    for key, default in DEFAULT_CALIBRATION_COLUMNS.items():
+        candidates = [c for c in (yaml_names.get(key), default) if c]
+        chosen = next((c for c in candidates if c in csv_columns), None)
+        if chosen is None:
+            if key in REQUIRED_CALIBRATION_KEYS:
+                missing.append(f"{key} (tried {candidates})")
+                continue
+            chosen = candidates[0]  # optional: neptoon falls back to the sensor_info average
+        elif yaml_names.get(key) and chosen != yaml_names[key]:
+            notes.append(f"YAML column '{yaml_names[key]}' for {key} not in CSV; using '{chosen}'")
+        mapping[key] = chosen
+    return mapping, notes, missing
+
+
+def load_calibration_dataset(calib_file: Path) -> pd.DataFrame:
     logger.info(f"Loading calibration dataset from: {calib_file}")
     df = pd.read_csv(calib_file)
-
-    if required_columns:
-        missing = [c for c in required_columns if c not in df.columns]
-        if missing:
-            raise ValueError(
-                f"Calibration CSV '{calib_file.name}' missing required columns: {missing}. "
-                f"Available columns: {list(df.columns)}. "
-                f"Check your calibration CSV or update the column mappings in "
-                f"processing/sensor_config/{sensor_id}/*.yaml under 'calibration.key_column_names'."
-            )
-
-    return df, calib_file
+    if df.empty:
+        raise ValueError(f"Calibration file has no rows: {calib_file}")
+    return df
 
 
-def get_corrected_timeseries_for_sensor(
-    sensor_id: str,
-    process_config_path: Path = None,
-) -> pd.DataFrame:
-    """Obtain corrected neutron timeseries by processing raw phases through Neptoon."""
-    if process_config_path is None:
-        process_config_path = PROCESSING_DIR / "process_config" / "default_config.yaml"
+# ---------------------------------------------------------------------------
+# YAML update (text based, keeps comments and formatting)
+# ---------------------------------------------------------------------------
 
-    target_data_dir = PROJECT_ROOT / "data"
-    yaml_configs = scan_yaml_files(target_data_dir)
-    groups = group_configs_by(yaml_configs, 'name')
+def update_sensor_info_values(yaml_path: Path, values: dict) -> None:
+    """Set sensor_info.<key> values in a YAML file without reformatting the rest of it."""
+    lines = yaml_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    start = next((i for i, line in enumerate(lines) if re.match(r"^sensor_info:\s*(#.*)?$", line)), None)
+    if start is None:
+        raise ValueError(f"No top-level sensor_info block in {yaml_path}")
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if stripped and not stripped.startswith("#") and not lines[i][0].isspace():
+            end = i
+            break
+    key_lines = [i for i in range(start + 1, end) if re.match(r"^\s+\w[\w.]*\s*:", lines[i])]
+    indent = re.match(r"^(\s+)", lines[key_lines[0]]).group(1) if key_lines else "  "
+    newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
 
-    target_entries = groups.get(sensor_id)
-    if not target_entries and sensor_id.isdigit():
-        norm_key = str(int(sensor_id))
-        target_entries = groups.get(norm_key) or groups.get(f"{int(sensor_id):02d}")
+    for key, value in values.items():
+        rendered = yaml.safe_dump(value, default_flow_style=True).strip()
+        rendered = rendered.removesuffix("...").strip()
+        pattern = re.compile(rf"^{re.escape(indent)}{re.escape(key)}\s*:(?P<value>[^#\n\r]*)(?P<comment>#.*)?(?P<eol>\r?\n)?$")
+        for i in key_lines:
+            match = pattern.match(lines[i])
+            if match:
+                comment = f" {match.group('comment')}" if match.group("comment") else ""
+                lines[i] = f"{indent}{key}: {rendered}{comment}{match.group('eol') or ''}"
+                break
+        else:
+            insert_at = (key_lines[-1] + 1) if key_lines else start + 1
+            lines.insert(insert_at, f"{indent}{key}: {rendered}{newline}")
+            key_lines = [k + 1 if k >= insert_at else k for k in key_lines] + [insert_at]
+            end += 1
 
-    if not target_entries:
-        raise ValueError(f"No phase configurations found for sensor '{sensor_id}' in {target_data_dir}")
+    new_text = "".join(lines)
+    parsed = yaml.safe_load(new_text)
+    for key, value in values.items():
+        if parsed.get("sensor_info", {}).get(key) != value:
+            raise ValueError(f"YAML update check failed for {yaml_path.name}: {key}")
+    yaml_path.write_text(new_text, encoding="utf-8")
 
-    logger.info(f"Preparing corrected timeseries for sensor '{sensor_id}' across {len(target_entries)} phase(s)...")
 
-    corrected_dfs = []
-    for entry in target_entries:
-        y_path = entry['yaml_path']
-        cfg = entry['config']
+# ---------------------------------------------------------------------------
+# Calibration
+# ---------------------------------------------------------------------------
 
-        patched = _patch_yaml_for_neptoon(y_path, cfg)
-        if patched is None:
-            continue
+def _calibrate_phase(name, window, cfg, samples, sample_times, text_df, hours_around_calib,
+                     proc_cfg_path, work_dir):
+    """Calibrate one phase with neptoon. Returns (phase_report, ts_df, results_df, weights_df)."""
+    phase_id = window["phase_id"]
+    mapping, notes, missing = resolve_calibration_columns(cfg, samples.columns)
+    for note in notes:
+        logger.info(f"  -> {phase_id}: {note}")
+    if missing:
+        raise ValueError(f"calibration CSV lacks required columns: {missing}")
 
-        temp_y = y_path.parent / "_temp_calib_cfg.yaml"
-        temp_out = y_path.parent / "_temp_calib_out"
-        try:
-            patched.setdefault('figures', {})['create_figures'] = True
-            patched['figures']['make_all_figures'] = False
-            patched['figures']['custom_list'] = []
-            patched.setdefault('data_storage', {})['create_report'] = False
-            patched['data_storage']['save_location'] = str(temp_out)
-            patched['data_storage']['save_folder'] = str(temp_out)
+    part = text_df[text_df["phase"] == phase_id]
+    if part.empty:
+        raise ValueError("no merged neutron data in this phase")
 
-            with open(temp_y, 'w', encoding='utf-8') as f:
-                yaml.dump(patched, f, default_flow_style=False, sort_keys=False)
+    csv_path = work_dir / f"{name}__{phase_id}.csv"
+    columns = write_neptoon_input(part, csv_path)
 
-            p = ProcessWithConfig(
-                path_to_sensor_config=str(temp_y),
-                path_to_process_config=str(process_config_path),
-            )
+    samples = samples.copy()
+    samples[mapping["date_time"]] = sample_times.dt.tz_convert("UTC").dt.strftime(SAMPLE_DT_FORMAT)
+    samples_path = work_dir / f"calibration_samples_{phase_id}.csv"
+    samples.to_csv(samples_path, index=False)
 
-            p.data_hub = p._create_data_hub(sensor_config=p.sensor_config)
-            p.data_hub = p._attach_nmdb_data(p.data_hub)
-            p.data_hub = p._prepare_static_values(p.data_hub)
-            p.data_hub = p._prepare_additional_columns(p.data_hub)
+    calibration_block = {
+        "calibrate": True,
+        "location": str(samples_path),
+        "date_time_format": SAMPLE_DT_FORMAT,
+        "key_column_names": mapping,
+        "hours_of_data_around_calib": hours_around_calib,
+    }
+    neptoon_cfg, _ = build_neptoon_sensor_config(cfg, csv_path, columns, calibration=calibration_block)
+    proc = run_neptoon(neptoon_cfg, proc_cfg_path, work_dir, until="soil_moisture")
 
-            p.data_hub = p._apply_quality_assessment(
-                data_hub=p.data_hub,
-                sensor_config=p.sensor_config,
-                partial_config=p.process_config.neutron_quality_assessment,
-                name_of_target="raw_neutrons",
-            )
-            if hasattr(p.sensor_config, "neutron_quality_assessment") and p.sensor_config.neutron_quality_assessment:
-                p.data_hub = p._apply_quality_assessment(
-                    data_hub=p.data_hub,
-                    sensor_config=p.sensor_config,
-                    partial_config=p.sensor_config.neutron_quality_assessment,
-                    name_of_target="raw_neutrons",
-                )
-            p.data_hub = p._apply_quality_assessment(
-                data_hub=p.data_hub,
-                sensor_config=p.sensor_config,
-                partial_config=p.sensor_config.input_data_qa,
-                name_of_target=None,
-            )
+    hub = proc.data_hub
+    calibrator = hub.calibrator
+    n0 = float(proc.sensor_config.sensor_info.N0)
+    results_df = calibrator.return_calibration_results_data_frame()
+    try:
+        weights_df = calibrator.return_weighting_dataframe()
+    except Exception:
+        weights_df = None
 
-            p.data_hub = p._select_corrections(
-                data_hub=p.data_hub,
-                process_config=p.process_config,
-                sensor_config=p.sensor_config,
-            )
-            p.data_hub = p._correct_neutrons(p.data_hub)
+    sample_averages = {}
+    for yaml_key, context_attr in SITE_PROPERTY_KEYS.items():
+        value = getattr(calibrator.context, context_attr, None)
+        if value is not None:
+            try:
+                sample_averages[yaml_key] = float(value)
+            except (TypeError, ValueError):
+                pass
 
-            if p.data_hub.crns_data_frame is not None and not p.data_hub.crns_data_frame.empty:
-                corrected_dfs.append(p.data_hub.crns_data_frame.copy())
-        except Exception as err:
-            logger.warning(f"  Note processing phase {y_path.parent.name}: {err}")
-        finally:
-            if temp_y.exists():
-                try:
-                    temp_y.unlink()
-                except Exception:
-                    pass
-
-    if not corrected_dfs:
-        raise RuntimeError(f"Failed to generate corrected neutron data for sensor '{sensor_id}'")
-
-    full_ts = pd.concat(corrected_dfs)
-    full_ts = full_ts[~full_ts.index.duplicated(keep='first')].sort_index()
-    logger.info(f"Loaded timeseries for calibration with {len(full_ts)} records ({full_ts.index.min()} to {full_ts.index.max()})")
-    return full_ts
+    report = {
+        "phase_id": phase_id,
+        "location": window.get("location"),
+        "config_file": window.get("config_file"),
+        "phase_start": str(window.get("start")),
+        "phase_end": str(window.get("end")),
+        "n_samples": int(len(samples)),
+        "calibration_days": sorted({str(t.date()) for t in sample_times}),
+        "N0_previous": (cfg.get("sensor_info") or {}).get("N0"),
+        "optimal_N0": int(round(n0)),
+        "optimal_N0_exact": n0,
+        "N0_uncertainty": getattr(proc.sensor_config.sensor_info, "N0_uncertainty", None),
+        "sample_averages": sample_averages,
+        "calibration_columns": mapping,
+        "campaign_results": results_df.to_dict(orient="records"),
+    }
+    return report, hub.crns_data_frame.copy(), results_df, weights_df
 
 
 def calibrate_sensor(
@@ -237,344 +293,270 @@ def calibrate_sensor(
     save_results: bool = True,
     process_config_path: Path = None,
 ) -> dict:
-    """Run full calibration for a sensor using Neptoon.
+    """Calibrate every phase of a sensor that has calibration samples.
 
-    Parameters
-    ----------
-    sensor_id : str
-        Sensor identifier (e.g. '01')
-    campaign_path : str, optional
-        Path to calibration CSV.
-    hours_around_calib : int
-        Window in hours around calibration datetime (default: 6).
-    update_yaml : bool
-        If True, updates N0 in sensor YAML templates.
-    save_results : bool
-        If True, saves report JSON and weights table CSV.
-    process_config_path : Path, optional
-        Path to process config YAML. Defaults to process_config/default_config.yaml.
-
-    Returns
-    -------
-    dict
-        Calibration summary and calculated metrics.
+    Returns the calibration report dict. Raises when no phase could be calibrated.
     """
     if sensor_id is None:
         raise ValueError("sensor_id is required. Pass --sensor <id> or specify sensor_id.")
+    proc_cfg_path = Path(process_config_path) if process_config_path else DEFAULT_PROCESS_CONFIG
+    with open(proc_cfg_path, "r", encoding="utf-8") as f:
+        proc_cfg = yaml.safe_load(f) or {}
+    sm_est = (proc_cfg.get("correction_steps") or {}).get("soil_moisture_estimation") or {}
+    method = sm_est.get("method", "desilets_etal_2010")
 
-    if process_config_path is None:
-        process_config_path = PROCESSING_DIR / "process_config" / "default_config.yaml"
-
-    sm_settings = _load_sm_estimation_settings(process_config_path)
-    method = sm_settings['method']
-    koehli_params = sm_settings['koehli_params']
+    sensors = load_sensors_from_excel(METADATA_FILE)
+    sensor_key, sensor_data = resolve_sensor(sensor_id, sensors)
+    name = sensor_name(sensor_key, sensor_data)
 
     logger.info("==================================================")
-    logger.info(f" Starting Calibration for Sensor '{sensor_id}'")
-    logger.info(f" Conversion Method: {method}" + (f" ({koehli_params})" if method == "koehli_etal_2021" else ""))
+    logger.info(f" Starting calibration for sensor '{name}' (metadata sheet '{sensor_key}')")
+    logger.info(f" Conversion method: {method}")
     logger.info("==================================================")
 
-    sensor_cfg = _load_sensor_config(sensor_id)
-    s_info_cfg = sensor_cfg.get('sensor_info', {})
-    calib_col_cfg = sensor_cfg.get('calibration', {}).get('key_column_names', {})
+    windows = read_phase_info(name)
+    merged_csv = MERGED_DIR / f"merged_{name}.csv"
+    if windows is None or not merged_csv.exists():
+        raise RuntimeError(f"No merged data for '{name}'; run the merge first "
+                           f"(auto_append.py --sensor {sensor_key})")
 
-    dt_col = calib_col_cfg.get('date_time', 'DateTime_utc')
-    col_map = {
-        'date_time': dt_col,
-        'profile_id': calib_col_cfg.get('profile_id', 'Profile_ID'),
-        'distance': calib_col_cfg.get('radial_distance_from_sensor', 'Distance_to_CRNS_m'),
-        'sample_depth': calib_col_cfg.get('sample_depth', 'Profile_Depth_cm'),
-        'soil_moisture': calib_col_cfg.get('gravimetric_soil_moisture', 'SoilMoisture_g_g'),
-        'bulk_density': calib_col_cfg.get('bulk_density_of_sample', 'DryBulkDensity_g_cm3'),
-        'soc': calib_col_cfg.get('soil_organic_carbon', 'SoilOrganicCarbon_g_g'),
-        'lattice_water': calib_col_cfg.get('lattice_water', 'LatticeWater_g_g'),
-    }
+    calib_file = find_calibration_file(sensor_key, sensor_data, campaign_path)
+    calib_df = load_calibration_dataset(calib_file)
+    configs = phase_configs(windows)
 
-    required_cols = list(col_map.values())
-    calib_df, calib_file_path = load_calibration_dataset(
-        sensor_id, campaign_path, required_columns=required_cols
-    )
+    # date/time column: first YAML-configured name present in the CSV, else the default
+    dt_candidates = [_yaml_calibration_names(c).get("date_time") for c in configs.values()]
+    dt_candidates = [c for c in dt_candidates if c] + [DEFAULT_CALIBRATION_COLUMNS["date_time"]]
+    dt_col = next((c for c in dt_candidates if c in calib_df.columns), None)
+    if dt_col is None:
+        raise ValueError(f"Calibration CSV has no date/time column (tried {dt_candidates})")
+    sample_times = pd.to_datetime(calib_df[dt_col], utc=True, errors="coerce")
+    if sample_times.isna().any():
+        raise ValueError(f"{int(sample_times.isna().sum())} calibration timestamps in '{dt_col}' could not be parsed")
 
-    ts_df = get_corrected_timeseries_for_sensor(sensor_id, process_config_path)
+    sample_phase = assign_phase_ids(sample_times, windows)
+    outside = sample_phase.isna()
+    if outside.any():
+        logger.warning(f"Skipping {int(outside.sum())} sample(s) outside all phase windows: "
+                       f"{sorted({str(t.date()) for t in sample_times[outside]})}")
 
-    calib_df['DateTime_parsed'] = pd.to_datetime(calib_df[dt_col], utc=True)
-    ts_min, ts_max = ts_df.index.min(), ts_df.index.max()
+    text_df = read_merged_csv_text(merged_csv)
+    if "phase" not in text_df.columns:
+        raise RuntimeError(f"{merged_csv.name} has no 'phase' column; re-run the merge with --force")
 
-    valid_mask = (calib_df['DateTime_parsed'] >= ts_min) & (calib_df['DateTime_parsed'] <= ts_max)
-    skipped_dates = calib_df.loc[~valid_mask, 'DateTime_parsed'].dt.date.unique()
-    if len(skipped_dates) > 0:
-        logger.warning(
-            f"Skipping calibration date(s) without timeseries coverage ({ts_min.date()} to {ts_max.date()}): {skipped_dates}"
-        )
-        calib_df = calib_df[valid_mask].copy()
+    work_dir = WORK_DIR / f"{name}_calibration"
+    clean_work_dir(work_dir)
+    phase_reports, failures = [], {}
+    plot_inputs = []
+    window_by_id = {w["phase_id"]: w for w in windows}
+    try:
+        for phase_id in [w["phase_id"] for w in windows]:
+            mask = (sample_phase == phase_id).to_numpy()
+            if not mask.any():
+                continue
+            window = window_by_id[phase_id]
+            logger.info(f"  -> {phase_id} ({window.get('location')}, {window.get('config_file')}): "
+                        f"{int(mask.sum())} samples")
+            cfg = configs.get(phase_id)
+            if cfg is None:
+                failures[phase_id] = f"config '{window.get('config_file')}' not found"
+                logger.error(f"  -> {phase_id}: {failures[phase_id]}")
+                continue
+            try:
+                report, ts_df, results_df, weights_df = _calibrate_phase(
+                    name, window, cfg, calib_df[mask], sample_times[mask], text_df,
+                    hours_around_calib, proc_cfg_path, work_dir,
+                )
+            except Exception as e:
+                failures[phase_id] = str(e)
+                logger.error(f"  -> {phase_id}: calibration failed: {e}")
+                continue
+            phase_reports.append(report)
+            plot_inputs.append((report, ts_df, results_df, weights_df))
+            logger.info(f"  -> {phase_id}: optimal N0 = {report['optimal_N0']} cph "
+                        f"(YAML had {report['N0_previous']})")
+            logger.info(f"     Campaign summary:\n{results_df.to_string(index=False)}")
+    finally:
+        clean_work_dir(work_dir)
 
-    if calib_df.empty:
-        raise ValueError(
-            f"No calibration data falls within the sensor timeseries range ({ts_min} to {ts_max})."
-        )
-
-    calib_df = calib_df.drop(columns=['DateTime_parsed'])
-    unique_calib_dates = pd.to_datetime(calib_df[dt_col]).dt.date.unique()
-    logger.info(f"Running calibration for dates: {unique_calib_dates} ({len(calib_df)} samples)")
-
-    calib_config = CalibrationConfiguration(
-        neutron_conversion_method=method,
-        koehli_parameters=koehli_params if method == "koehli_etal_2021" else "Mar21_mcnp_drf",
-        hours_of_data_around_calib=hours_around_calib,
-        calib_data_date_time_column_name=col_map['date_time'],
-        calib_data_date_time_format="%Y-%m-%d %H:%M",
-        profile_id_column=col_map['profile_id'],
-        distance_column=col_map['distance'],
-        sample_depth_column=col_map['sample_depth'],
-        soil_moisture_gravimetric_column=col_map['soil_moisture'],
-        bulk_density_of_sample_column=col_map['bulk_density'],
-        soil_organic_carbon_column=col_map['soc'],
-        lattice_water_column=col_map['lattice_water'],
-    )
-
-    from magazine import Magazine
-    from neptoon.hub.crns_data_hub import CRNSDataHub
-    from neptoon.config.configuration_input import SensorInfo
-
-    Magazine.active = True
-    Magazine.clean()
-
-    lat = float(s_info_cfg.get('latitude', 0))
-    lon = float(s_info_cfg.get('longitude', 0))
-    elev = float(s_info_cfg.get('elevation', 0))
-    init_n0 = float(s_info_cfg.get('N0', 1000))
-
-    s_info = SensorInfo(
-        name=str(s_info_cfg.get('name', sensor_id)),
-        identifier=str(s_info_cfg.get('identifier', sensor_id)),
-        country=str(s_info_cfg.get('country', '')),
-        install_date=str(s_info_cfg.get('install_date', '2019-01-01')),
-        time_zone=int(s_info_cfg.get('time_zone', 0)),
-        latitude=lat,
-        longitude=lon,
-        elevation=elev,
-        N0=init_n0,
-    )
-
-    hub = CRNSDataHub(
-        crns_data_frame=ts_df,
-        sensor_info=s_info,
-        calibration_samples_data=calib_df,
-    )
-
-    hub.calibrate_station(config=calib_config)
-    optimal_n0 = float(hub.sensor_info.N0)
-    optimal_n0_rounded = int(round(optimal_n0))
-
-    hub.produce_soil_moisture_estimates()
-    hub.create_figures(create_all=True)
-
-    cal_station = hub.calibrator
-    results_df = cal_station.return_calibration_results_data_frame()
-    weights_df = cal_station.return_weighting_dataframe()
-
-    site_bd = float(hub.sensor_info.avg_dry_soil_bulk_density) if hub.sensor_info.avg_dry_soil_bulk_density is not None else float(cal_station.context.list_of_profiles[0].site_avg_bulk_density)
-    site_soc = float(hub.sensor_info.avg_soil_organic_carbon) if hub.sensor_info.avg_soil_organic_carbon is not None else float(cal_station.context.list_of_profiles[0].site_avg_organic_carbon)
-    site_lw = float(hub.sensor_info.avg_lattice_water) if hub.sensor_info.avg_lattice_water is not None else float(cal_station.context.list_of_profiles[0].site_avg_lattice_water)
-
-    logger.info("\n" + "=" * 54)
-    logger.info(f" CALIBRATION RESULT FOR SENSOR '{sensor_id}'")
-    logger.info("=" * 54)
-    logger.info(f" Optimal N0 : {optimal_n0_rounded} cph (exact: {optimal_n0:.2f})")
-    logger.info(f" Method     : {method}")
-    logger.info(f" Site Bulk Density (dry)  : {site_bd:.4f} g/cm³")
-    logger.info(f" Site Soil Organic Carbon : {site_soc:.5f} g/g")
-    logger.info(f" Site Lattice Water       : {site_lw:.5f} g/g")
-    logger.info("-" * 54)
-    logger.info(f" Campaign Summary:\n{results_df.to_string(index=False)}")
-    logger.info("=" * 54)
-
-    out_results_dir = PROJECT_ROOT / "data" / ".processed" / "calibration_results"
-    out_results_dir.mkdir(parents=True, exist_ok=True)
+    if not phase_reports:
+        raise RuntimeError(f"No phase of '{name}' could be calibrated: {failures or 'no samples in any phase'}")
 
     report_dict = {
-        "sensor": sensor_id,
+        "sensor": name,
+        "metadata_sheet": sensor_key,
         "calibration_timestamp": pd.Timestamp.now().isoformat(),
         "method": method,
-        "koehli_parameters": koehli_params if method == "koehli_etal_2021" else None,
-        "optimal_N0": optimal_n0_rounded,
-        "optimal_N0_exact": float(optimal_n0),
-        "site_properties": {
-            "dry_soil_bulk_density_g_cm3": site_bd,
-            "soil_organic_carbon_g_g": site_soc,
-            "lattice_water_g_g": site_lw,
-        },
-        "campaign_results": results_df.to_dict(orient="records"),
-        "calibration_data_file": str(calib_file_path),
+        "koehli_parameters": sm_est.get("koehli_etal_2021_parameterset") if method == "koehli_etal_2021" else None,
+        "calibration_data_file": str(calib_file),
+        "process_config": str(proc_cfg_path),
+        "phases": phase_reports,
+        "failed_phases": failures,
     }
 
     if save_results:
-        report_file = out_results_dir / f"calibration_report_{sensor_id}.json"
-        with open(report_file, 'w', encoding='utf-8') as f:
-            json.dump(report_dict, f, indent=2, default=str)
-        logger.info(f"Saved calibration report -> {report_file}")
-
-        if weights_df is not None and not weights_df.empty:
-            weights_file = out_results_dir / f"calibration_sample_weights_{sensor_id}.csv"
-            weights_df.to_csv(weights_file, index=False)
-            logger.info(f"Saved sample weights -> {weights_file}")
-
-        try:
-            generate_calibration_plots(
-                sensor_id=sensor_id,
-                ts_df=ts_df,
-                results_df=results_df,
-                weights_df=weights_df,
-                report_dict=report_dict,
-                output_dir=out_results_dir,
-            )
-        except Exception as plot_err:
-            logger.warning(f"Calibration plot generation notice: {plot_err}")
+        _save_results(name, report_dict, plot_inputs)
 
     if update_yaml:
-        update_sensor_yaml_n0(sensor_id, optimal_n0_rounded, site_bd, site_soc, site_lw)
-        try:
-            from copy_yamls import load_sensors, METADATA_FILE, TARGET_DATA_DIR, SENSOR_CONFIG_DIR
-            if METADATA_FILE.exists():
-                sensors = load_sensors(METADATA_FILE)
-                for s_key, s_data in sensors.items():
-                    if s_key != sensor_id and str(int(s_key) if s_key.isdigit() else s_key) != str(int(sensor_id) if sensor_id.isdigit() else sensor_id):
-                        continue
-                    root_folder = s_data.get("root_folder_name")
-                    if not root_folder:
-                        continue
-                    s_dir = TARGET_DATA_DIR / root_folder
-                    for phase in s_data.get("phase", []):
-                        p_folder = phase.get("folder_name")
-                        cfg_file = phase.get("config_file")
-                        if not p_folder or not cfg_file:
-                            continue
-                        src_path = SENSOR_CONFIG_DIR / cfg_file
-                        if not src_path.exists():
-                            continue
-                        for l_key, subf in [("ftp_folder", "ftp"), ("field_folder", "sd"), ("field_pr2_folder", "sd_pr2"), ("field_theta_folder", "sd_theta")]:
-                            if l_key in phase.get("source_lookup", {}):
-                                d_file = s_dir / p_folder / subf / Path(cfg_file).name
-                                if d_file.parent.exists():
-                                    shutil.copy2(src_path, d_file)
-                logger.info(f"Synced updated YAML configs to data folders for sensor {sensor_id}")
-        except Exception as e:
-            logger.warning(f"Note syncing YAMLs to data folders: {e}")
+        report_dict["yaml_updates"] = update_phase_yamls(sensor_key, sensor_data, phase_reports, method)
 
     return report_dict
 
 
-def update_sensor_yaml_n0(
-    sensor_id: str,
-    n0_value: int,
-    bulk_density: float = None,
-    soc: float = None,
-    lattice_water: float = None,
-):
-    """Update N0 and site soil properties in sensor YAML files."""
-    cfg_dir = PROCESSING_DIR / "sensor_config" / sensor_id
-    if not cfg_dir.exists() and sensor_id.isdigit():
-        cfg_dir = PROCESSING_DIR / "sensor_config" / f"{int(sensor_id):02d}"
+def _save_results(name, report_dict, plot_inputs):
+    from plots_and_reports import generate_calibration_plots
 
-    if not cfg_dir.exists():
-        logger.warning(f"Sensor config directory not found: {cfg_dir}")
-        return
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    report_file = RESULTS_DIR / f"calibration_report_{name}.json"
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(report_dict, f, indent=2, default=str)
+    logger.info(f"Saved calibration report -> {report_file}")
 
-    yaml_files = list(cfg_dir.glob("*.yaml"))
-    for yf in yaml_files:
+    for report, ts_df, results_df, weights_df in plot_inputs:
+        label = f"{name}_{report['phase_id']}"
+        if weights_df is not None and not weights_df.empty:
+            weights_file = RESULTS_DIR / f"calibration_sample_weights_{label}.csv"
+            weights_df.to_csv(weights_file, index=False)
+            logger.info(f"Saved sample weights -> {weights_file}")
         try:
-            with open(yf, 'r', encoding='utf-8') as f:
-                content = yaml.safe_load(f)
+            generate_calibration_plots(
+                sensor_id=label,
+                ts_df=ts_df,
+                results_df=results_df,
+                weights_df=weights_df,
+                report_dict={**report, "method": report_dict["method"]},
+                output_dir=RESULTS_DIR,
+            )
+        except Exception as plot_err:
+            logger.warning(f"Calibration plot generation failed for {label}: {plot_err}")
 
-            if not isinstance(content, dict) or 'sensor_info' not in content:
-                continue
 
-            content['sensor_info']['N0'] = n0_value
-            if bulk_density is not None:
-                content['sensor_info']['avg_dry_soil_bulk_density'] = bulk_density
-            if soc is not None:
-                content['sensor_info']['avg_soil_organic_carbon'] = soc
-            if lattice_water is not None:
-                content['sensor_info']['avg_lattice_water'] = lattice_water
+def update_phase_yamls(sensor_key: str, sensor_data: dict, phase_reports: list,
+                       method: str = "desilets_etal_2010") -> dict:
+    """Write calibrated N0 into the YAML of each calibrated phase only.
 
-            with open(yf, 'w', encoding='utf-8') as f:
-                yaml.dump(content, f, default_flow_style=False, sort_keys=False)
-            logger.info(f"Updated N0={n0_value} in {yf.name}")
+    If the YAML keeps method-specific values (N0_<method>), that key is updated instead
+    of N0. Site soil properties are only filled where the YAML has no value. If several
+    calibrated phases share one YAML with different N0 values, that YAML is left unchanged.
+    """
+    by_file = {}
+    for report in phase_reports:
+        by_file.setdefault(report["config_file"], []).append(report)
+
+    updates = {}
+    for config_file, reports in by_file.items():
+        yaml_path = SENSOR_CONFIG_DIR / config_file
+        n0_values = {r["optimal_N0"] for r in reports}
+        if len(n0_values) > 1:
+            msg = (f"phases {[r['phase_id'] for r in reports]} share {config_file} but calibrated to "
+                   f"different N0 values {sorted(n0_values)}; YAML not updated")
+            logger.warning(msg)
+            updates[config_file] = msg
+            continue
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            current = (yaml.safe_load(f) or {}).get("sensor_info", {})
+        n0_key = f"N0_{method}" if f"N0_{method}" in current else "N0"
+        values = {n0_key: reports[0]["optimal_N0"]}
+        for key, value in reports[0]["sample_averages"].items():
+            if current.get(key) is None:
+                values[key] = round(value, 5)
+        try:
+            update_sensor_info_values(yaml_path, values)
         except Exception as e:
-            logger.error(f"Failed to update {yf.name}: {e}")
+            logger.error(f"Failed to update {config_file}: {e}")
+            updates[config_file] = f"failed: {e}"
+            continue
+        logger.info(f"Updated {config_file}: {values}")
+        updates[config_file] = values
+
+    # refresh the copies of the changed YAMLs in the data folders
+    try:
+        from copy_yamls import sync_sensor_configs
+        sync_sensor_configs(sensor_key, sensor_data, log_fn=logger.info)
+    except Exception as e:
+        logger.warning(f"Could not sync updated YAMLs to data folders: {e}")
+    return updates
 
 
-def run_pipeline(sensor=None, update_yaml=True, process_config=None, **kwargs):
-    """Pipeline integration runner for calibration step."""
-    target_sensors = []
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+
+def _discover_calibration_sensors(sensors: dict) -> list:
+    """Sheet names of sensors that have a calibration_<id>.csv in a calibration folder."""
+    found = []
+    for directory in CALIBRATION_DIRS:
+        if not directory.exists():
+            continue
+        for path in directory.glob("calibration_*.csv"):
+            sensor_filter = parse_sensor_filter([path.stem.replace("calibration_", "", 1)])
+            for key, data in sensors.items():
+                if sensor_matches(sensor_filter, key, data) and key not in found:
+                    found.append(key)
+    return found
+
+
+def run_pipeline(sensor=None, update_yaml=False, process_config=None, campaign_path=None,
+                 hours_around_calib=6, save_results=True, **kwargs):
+    """Calibrate the given sensors (default: every sensor with a calibration file)."""
+    sensors = load_sensors_from_excel(METADATA_FILE)
     if sensor:
-        if isinstance(sensor, str):
-            sensor = [sensor]
-        for s in sensor:
-            if "+" in s:
-                target_sensors.extend([x.strip() for x in s.split("+") if x.strip()])
-            elif "," in s:
-                target_sensors.extend([x.strip() for x in s.split(",") if x.strip()])
-            else:
-                target_sensors.append(str(s))
+        sensor_filter = parse_sensor_filter(sensor)
+        targets = [k for k, v in sensors.items() if sensor_matches(sensor_filter, k, v)]
+        if not targets:
+            raise ValueError(f"No sensor in the metadata matches {sorted(sensor_filter)}")
     else:
-        calib_dirs = [
-            PROJECT_ROOT / "data" / "calibration",
-            PROCESSING_DIR / "calibration" / "data",
-        ]
-        for c_dir in calib_dirs:
-            if c_dir.exists():
-                for cf in c_dir.glob("calibration_*.csv"):
-                    stem = cf.stem.replace("calibration_", "")
-                    if "_" not in stem:
-                        target_sensors.append(stem)
+        targets = _discover_calibration_sensors(sensors)
+        if not targets:
+            logger.info("No calibration data found and no --sensor specified. Skipping calibration.")
+            return {}
+    if campaign_path and len(targets) > 1:
+        raise ValueError("--campaign can only be used with a single sensor")
 
-    if not target_sensors:
-        logger.info("No calibration data found and no --sensor specified. Skipping calibration.")
-        return {}
-
-    target_sensors = sorted(list(set(target_sensors)))
-    logger.info(f"Calibrating sensor(s): {target_sensors}")
-
-    results = {}
-    for s_id in target_sensors:
+    logger.info(f"Calibrating sensor(s): {targets}")
+    results, failed = {}, {}
+    for key in targets:
         try:
-            res = calibrate_sensor(
-                sensor_id=s_id,
+            results[key] = calibrate_sensor(
+                sensor_id=key,
+                campaign_path=campaign_path,
+                hours_around_calib=hours_around_calib,
                 update_yaml=update_yaml,
+                save_results=save_results,
                 process_config_path=Path(process_config) if process_config else None,
             )
-            results[s_id] = res
         except Exception as e:
-            logger.error(f"Failed calibration for sensor '{s_id}': {e}")
-
+            logger.error(f"Failed calibration for sensor '{key}': {e}")
+            failed[key] = str(e)
+    if failed:
+        raise RuntimeError(f"Calibration failed for {len(failed)} sensor(s): {sorted(failed)}")
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Calibrate CRNS sensor N0 parameter with Neptoon.")
-    parser.add_argument("--sensor", "-s", type=str, required=True,
-                        help="Sensor name/ID to calibrate (e.g. 01)")
+    parser = argparse.ArgumentParser(description="Calibrate CRNS sensor N0 with neptoon, phase by phase.")
+    parser.add_argument("--sensor", "-s", type=str, nargs="+", default=None,
+                        help="Sensor(s) to calibrate (default: all sensors with a calibration file)")
     parser.add_argument("--campaign", "-c", type=str, default=None,
-                        help="Path to calibration CSV file (default: data/calibration/calibration_<sensor>.csv)")
+                        help="Path to calibration CSV file (single sensor only; "
+                             "default: data/.calibration/calibration_<sensor>.csv)")
     parser.add_argument("--hours-window", "-w", type=int, default=6,
-                        help="Hours around calibration datetime to average (default: 6)")
+                        help="Hours of neutron data around each calibration time (default: 6)")
     parser.add_argument("--update-yaml", "-u", action="store_true",
-                        help="Write calibrated N0 and site properties to sensor config YAMLs")
+                        help="Write the calibrated N0 into the YAML of each calibrated phase")
     parser.add_argument("--no-save", action="store_true",
                         help="Do not save calibration report files")
     parser.add_argument("--process-config", "-p", type=str, default=None,
                         help="Path to process config YAML (controls conversion method)")
-
     args = parser.parse_args()
 
-    calibrate_sensor(
-        sensor_id=args.sensor,
+    run_pipeline(
+        sensor=args.sensor,
+        update_yaml=args.update_yaml,
+        process_config=args.process_config,
         campaign_path=args.campaign,
         hours_around_calib=args.hours_window,
-        update_yaml=args.update_yaml,
         save_results=not args.no_save,
-        process_config_path=Path(args.process_config) if args.process_config else None,
     )
 
 

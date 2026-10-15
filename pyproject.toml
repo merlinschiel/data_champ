@@ -1,6 +1,6 @@
 [project]
 name = "data_champ"
-version = "1.0.0"
+version = "2.0.0"
 description = "Automated pipeline for syncing, merging, and processing Cosmic-Ray Neutron Sensor (CRNS) data into a unified, analysis-ready format."
 readme = "README.md"
 license = {text = "MIT"}
@@ -13,19 +13,19 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Hydrology",
     "License :: OSI Approved :: MIT License",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "folium>=0.14,<1.0",
     "matplotlib>=3.5,<4.0",
-    "neptoon>=0.14.0",
+    "neptoon>=1.2,<2",
     "openpyxl>=3.1,<4.0",
-    "pandas>=2.0,<3.0",
+    "pandas>=3.0.2,<4.0",
     "python-dotenv>=1.0,<2.0",
     "pyyaml>=6.0,<7.0",
     "requests>=2.28,<3.0",
     "streamlit>=1.35,<2.0",
-    "plotly>=5.18,<6.0",
-    "kaleido>=0.2.1",
+    "plotly>=6.1",
+    "kaleido>=1.0",
 ]
 
 [build-system]
@@ -37,4 +37,3 @@ packages = ["processing"]
 
 [project.urls]
 Repository = "https://github.com/merlinschiel/data_champ"
-

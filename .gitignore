@@ -24,8 +24,10 @@ processing/meta/logs/
 processing/meta/sync_cache.json
 processing/meta/sync_cache.tmp
 
-# Parsed file caches
+# Parsed file caches and merge/neptoon working state
 data/.merged/parsed_cache/
+data/.merged/_neptoon_work/
+data/.merged/sensor_configs/merge_state.json
 *.pkl
 
 # Processed outputs cache

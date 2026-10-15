@@ -1,7 +1,13 @@
-
+"""
+Data sync step: downloads raw files from FTP servers and HTTP APIs and copies field/SD
+card data into data/<sensor>/<phase>/<ftp|sd|sd_pr2|sd_theta>, as defined in
+processing/meta/sensor_metadata.xlsx. Also keeps the phase config YAMLs in the data
+folders in sync with processing/sensor_config.
+"""
 
 import shutil
 import os
+import re
 import json
 import hashlib
 import ftplib
@@ -9,50 +15,46 @@ import io
 import argparse
 import requests
 import pandas as pd
-import logging
 import traceback
 from pathlib import Path
 from datetime import datetime
+
+from copy_yamls import sync_sensor_configs
+from log_utils import get_logger
+from sensor_metadata import (
+    METADATA_FILE,
+    META_DIR,
+    PROJECT_ROOT,
+    TARGET_DATA_DIR,
+    load_sensors_from_excel,
+    parse_sensor_filter,
+    sensor_matches,
+)
 
 # ---------------------------------------------------------------------------
 # Configs — all paths relative to project root
 # ---------------------------------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-FIELD_PATH = Path(os.environ.get("CRNS_FIELD_DATA_PATH", "")) if os.environ.get("CRNS_FIELD_DATA_PATH") else None
-PROCESSING_DIR = PROJECT_ROOT / "processing"
-META_DIR = PROCESSING_DIR / "meta"
-LOG_DIR = META_DIR / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "copydata.log"
+# field/SD data root; Field_Folder patterns are relative to it. Set CRNS_FIELD_DATA_PATH
+# to point elsewhere, otherwise the folder next to the project is used.
+FIELD_PATH = Path(os.environ.get("CRNS_FIELD_DATA_PATH") or PROJECT_ROOT.parent)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, mode='w', encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger(__name__)
+logger = get_logger("copydata", "copydata.log")
 
-TARGET_DATA_DIR = PROJECT_ROOT / "data"
-METADATA_FILE = META_DIR / "sensor_metadata.xlsx"
-SENSOR_CONFIG_DIR = PROCESSING_DIR / "sensor_config"
 FTP_SOURCES_FILE = META_DIR / "ftp_sources.txt"
 SYNC_CACHE_FILE = META_DIR / "sync_cache.json"
 
 
 
 # ---------------------------------------------------------------------------
-# HTTP API downloads (e.g. Finapp sensors) — config-driven
+# HTTP API downloads
 # ---------------------------------------------------------------------------
 
 def download_api_data():
     """Download data from HTTP APIs defined in processing/meta/api_sources.txt."""
     api_config_file = META_DIR / "api_sources.txt"
     if not api_config_file.exists():
-        logger.info("No api_sources.txt found — skipping API downloads.")
+        logger.info("No api_sources.txt found")
         return
     
     try:
@@ -73,7 +75,7 @@ def download_api_data():
             continue
         dest_path = PROJECT_ROOT / rel_dest
         try:
-            response = requests.get(url, timeout=30)
+            response = requests.get(url, timeout=(30, 300))
             response.raise_for_status()
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             with open(dest_path, "wb") as f:
@@ -156,25 +158,17 @@ def close_all_ftp():
     _ftp_connections.clear()
     _ftp_listing_cache.clear()
 
-def get_remote_file_info(ftp: ftplib.FTP, host: str, entry: str) -> tuple:
-    """Always fetch fresh size/mtime from FTP server (no disk cache)."""
-    size = 0
-    mtime = ""
-    try:
-        size = ftp.size(entry) or 0
-    except Exception:
-        pass
-    try:
-        resp = ftp.sendcmd(f"MDTM {entry}")
-        mtime = resp[4:].strip()
-    except Exception:
-        pass
+def get_remote_file_info(ftp: ftplib.FTP, entry: str) -> tuple:
+    """Fetch size and MDTM modification time of a remote file."""
+    size = ftp.size(entry)
+    mtime = ftp.sendcmd(f"MDTM {entry}")[4:].strip()
     return size, mtime
 
 
 def ftp_list_files(ftp: ftplib.FTP, host: str, remote_dir: str, _depth: int = 0) -> list[dict]:
     """Return list of {'name': basename, 'path': full_path, 'size': int, 'mtime': str}.
-    Recurses into subdirectories. Uses NLST + per-file SIZE/MDTM."""
+    Recurses into subdirectories. Uses NLST + per-file SIZE/MDTM (the servers in use do
+    not support MLSD)."""
     results = []
     if _depth == 0:
         logger.info(f"    Listing FTP dir: {remote_dir}")
@@ -182,7 +176,9 @@ def ftp_list_files(ftp: ftplib.FTP, host: str, remote_dir: str, _depth: int = 0)
     try:
         ftp.sendcmd("TYPE I")
         entries = ftp.nlst(remote_dir)
-    except Exception:
+    except Exception as e:
+        if _depth == 0:
+            logger.warning(f"    Could not list FTP dir '{remote_dir}' on {host}: {e}")
         return results
 
     for entry in entries:
@@ -211,7 +207,11 @@ def ftp_list_files(ftp: ftplib.FTP, host: str, remote_dir: str, _depth: int = 0)
         if should_skip_file(basename):
             continue
 
-        size, mtime = get_remote_file_info(ftp, host, entry)
+        try:
+            size, mtime = get_remote_file_info(ftp, entry)
+        except ftplib.all_errors as e:
+            logger.error(f"    Could not read size/mtime of '{entry}' on {host}: {e}")
+            continue
         results.append({"name": basename, "path": entry, "size": size, "mtime": mtime})
 
     if _depth == 0:
@@ -253,37 +253,9 @@ def ftp_download(ftp: ftplib.FTP, remote_path: str, dest_path: Path, mtime_str: 
 # Sync cache
 # ---------------------------------------------------------------------------
 
-def to_relative_key(key: str) -> str:
-    key_norm = key.replace("\\", "/")
-    if key_norm.startswith("data/"):
-        return key_norm
-
-    try:
-        rel = os.path.relpath(key_norm, PROJECT_ROOT)
-        return rel.replace("\\", "/")
-    except Exception:
-        pass
-
-    if "data/" in key_norm:
-        return "data/" + key_norm.split("data/")[-1]
-    return key_norm
-
-
-def to_relative_src(src_path: str) -> str:
-    if not src_path:
-        return src_path
-    
-    normalized = src_path.replace("\\", "/")
-    if not (":" in normalized or normalized.startswith("/") or normalized.startswith("//")):
-        return normalized
-
-    try:
-        rel = os.path.relpath(normalized, PROJECT_ROOT)
-        return rel.replace("\\", "/")
-    except Exception:
-        pass
-        
-    return normalized
+def to_relative_key(dest_key: str) -> str:
+    """Cache key of a destination file: its path relative to the project root."""
+    return Path(dest_key).relative_to(PROJECT_ROOT).as_posix()
 
 
 def load_sync_cache() -> dict:
@@ -322,20 +294,30 @@ def compute_sensor_hash(sensor_data: dict) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def _normalise_mtime(mtime) -> str:
+    """FTP MDTM times come as YYYYMMDDHHMMSS[.fff]; compare on whole seconds."""
+    text = str(mtime or "").strip()
+    match = re.match(r"^(\d{14})", text)
+    return match.group(1) if match else text
+
+
 def is_cached(cache: dict, dest_key: str, src_size: int, src_mtime: str) -> bool:
+    """True if the destination file exists and was synced from a source with this size/mtime."""
     r_key = to_relative_key(dest_key)
     entry = cache.get("files", {}).get(r_key)
     if not entry:
         return False
-    return entry.get("src_size") == src_size and entry.get("src_mtime") == src_mtime
+    if not Path(dest_key).exists():
+        return False
+    return (entry.get("src_size") == src_size
+            and _normalise_mtime(entry.get("src_mtime")) == _normalise_mtime(src_mtime))
 
 
 def update_cache_entry(cache: dict, dest_key: str, src_path: str, src_size: int, src_mtime: str):
     r_key = to_relative_key(dest_key)
-    r_src = to_relative_src(src_path)
 
     cache.setdefault("files", {})[r_key] = {
-        "src_path": r_src,
+        "src_path": str(src_path).replace("\\", "/"),
         "src_size": src_size,
         "src_mtime": src_mtime,
         "synced_at": datetime.now().isoformat(),
@@ -349,118 +331,6 @@ def invalidate_sensor_cache(cache: dict, sensor_root: str):
         del cache["files"][k]
     if keys_to_drop:
         logger.info(f"  Cache invalidated: {len(keys_to_drop)} entries for {sensor_root}")
-
-
-# ---------------------------------------------------------------------------
-# Metadata loading
-# ---------------------------------------------------------------------------
-
-def _get_cell(row, col):
-    """Read a cell from an Excel row, return stripped string or None."""
-    val = row.get(col, "")
-    if pd.notna(val) and str(val).strip():
-        return str(val).strip()
-    return None
-
-
-def _parse_date_cell(row, col):
-    """Read a date cell, return formatted string or None."""
-    raw = row.get(col, "")
-    if not pd.notna(raw) or not str(raw).strip():
-        return None
-    val = raw
-    if isinstance(val, (pd.Timestamp, datetime)):
-        if val.hour == 0 and val.minute == 0 and val.second == 0:
-            val = val.strftime("%Y-%m-%d")
-        else:
-            val = val.strftime("%Y-%m-%d %H:%M:%S")
-    return str(val).strip()
-
-
-def _parse_folder_cell(row, col):
-    """Read a folder cell that may be comma-separated. Returns str, list, or None."""
-    val = _get_cell(row, col)
-    if not val:
-        return None
-    if "," in val:
-        return [s.strip() for s in val.split(",") if s.strip()]
-    return val
-
-
-def load_sensors_from_excel(filepath: Path) -> dict:
-    """Load sensor metadata from Excel into a dict of {sheet_name: sensor_data}."""
-    xls = pd.ExcelFile(filepath)
-    sensors = {}
-
-    for sheet_name in xls.sheet_names:
-        # Skip the config_meta sheet
-        if sheet_name.lower() == "config_meta":
-            continue
-
-        df = pd.read_excel(xls, sheet_name=sheet_name)
-        # Normalise column names
-        df.columns = df.columns.str.strip()
-
-        sensor_key = sheet_name
-
-        # --- sensor-level fields (same for every row) ---
-        active_val = df["Active"].iloc[0] if "Active" in df.columns and len(df) > 0 else False
-        if isinstance(active_val, str):
-            active = active_val.strip().lower() in ("true", "1", "yes")
-        else:
-            active = bool(active_val)
-
-        root_folder = str(df["Root_Folder"].iloc[0]).strip().lstrip('0') or '0' if "Root_Folder" in df.columns and len(df) > 0 else sensor_key
-        # Preserve original string — read_excel may strip leading zeros
-        # Try to recover from the raw cell value
-        if "Root_Folder" in df.columns and len(df) > 0:
-            raw_val = df["Root_Folder"].iloc[0]
-            root_folder = str(raw_val).strip()
-        else:
-            root_folder = sensor_key
-
-        # --- build phase list (one row = one phase) ---
-        phases = []
-        for _, row in df.iterrows():
-            phase = {}
-
-            sd = _parse_date_cell(row, "Phase_Start_Date")
-            if sd: phase["start_date"] = sd
-
-            ed = _parse_date_cell(row, "Phase_End_Date")
-            if ed: phase["end_date"] = ed
-
-            for excel_col, phase_key in [
-                ("Phase_Folder", "folder_name"),
-                ("Config", "config_file"),
-                ("Phase_Location", "location"),
-                ("Phase_Description", "description"),
-            ]:
-                val = _get_cell(row, excel_col)
-                if val: phase[phase_key] = val
-
-            # source_lookup  (ftp / field folders — may be comma-separated lists)
-            source_lookup = {}
-            ftp_val = _parse_folder_cell(row, "FTP_Folder")
-            if ftp_val: source_lookup["ftp_folder"] = ftp_val
-            field_val = _parse_folder_cell(row, "Field_Folder")
-            if field_val: source_lookup["field_folder"] = field_val
-            field_pr2_val = _parse_folder_cell(row, "Field_PR2_Folder")
-            if field_pr2_val: source_lookup["field_pr2_folder"] = field_pr2_val
-            field_theta_val = _parse_folder_cell(row, "Field_Theta_Folder")
-            if field_theta_val: source_lookup["field_theta_folder"] = field_theta_val
-            if source_lookup:
-                phase["source_lookup"] = source_lookup
-
-            phases.append(phase)
-
-        sensors[sensor_key] = {
-            "active": active,
-            "root_folder_name": root_folder,
-            "phase": phases,
-        }
-
-    return sensors
 
 
 # ---------------------------------------------------------------------------
@@ -639,27 +509,15 @@ def gather_files_for_phase(base_path: Path, phase: dict, key: str, valid_filenam
     for pattern in lookup_patterns:
         clean_pattern = pattern.strip("/")
         try:
-            for matched_dir in base_path.glob(clean_pattern):
-                try:
-                    if matched_dir.is_dir():
-                        for file_pattern in valid_filenames:
-                            try:
-                                found = list(matched_dir.rglob(file_pattern))
-                                for f in found:
-                                    try:
-                                        if f.is_file() and not should_skip_file(f.name):
-                                            files.append(f)
-                                    except Exception as e:
-                                        logger.error(f"Error accessing file {f}: {e}")
-                            except Exception as e:
-                                logger.error(f"Error globbing {file_pattern} in {matched_dir}: {e}")
-                    elif matched_dir.is_file():
-                        if not should_skip_file(matched_dir.name):
-                            files.append(matched_dir)
-                except Exception as e:
-                    logger.error(f"Error processing {matched_dir}: {e}")
-        except Exception as e:
-            logger.error(f"Error resolving pattern {clean_pattern} in {base_path}: {e}")
+            for matched in base_path.glob(clean_pattern):
+                if matched.is_dir():
+                    for file_pattern in valid_filenames:
+                        files.extend(f for f in matched.rglob(file_pattern)
+                                     if f.is_file() and not should_skip_file(f.name))
+                elif matched.is_file() and not should_skip_file(matched.name):
+                    files.append(matched)
+        except OSError as e:
+            logger.error(f"Error reading field files for pattern {clean_pattern} in {base_path}: {e}")
     return list(set(files))
 
 
@@ -674,11 +532,6 @@ def sync_local_file(src_path: Path, dest_path: Path, cache: dict, force=False) -
         if not force and is_cached(cache, dest_key, src_size, src_mtime):
             return False
 
-        if not force and dest_path.exists():
-            if dest_path.stat().st_size == src_size:
-                # Size match — update cache, skip copy
-                update_cache_entry(cache, dest_key, str(src_path), src_size, src_mtime)
-                return False
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src_path, dest_path)
@@ -718,39 +571,39 @@ def process_field_files(files, phases, phase_info, sensor_dir, cache, force,
 
 
 
+
+
+
 # ---------------------------------------------------------------------------
 # Stale folder cleanup
 # ---------------------------------------------------------------------------
 
 def cleanup_stale_phase_folders(sensor_dir: Path, phases: list) -> None:
-    """Delete subdirectories of sensor_dir that are not referenced by any phase."""
-    valid_folders = set()
-    for phase in phases:
-        fn = phase.get("folder_name")
-        if fn:
-            valid_folders.add(fn)
+    """Delete subdirectories of sensor_dir that no phase references.
 
+    This folder is a copy of the original data, so anything deleted here is re-synced
+    from the source if the phase reappears in the metadata.
+    """
+    valid_folders = {phase.get("folder_name") for phase in phases if phase.get("folder_name")}
     if not sensor_dir.exists():
         return
 
     for child in sensor_dir.iterdir():
-        if not child.is_dir():
+        if not child.is_dir() or child.name in valid_folders:
             continue
-        if child.name not in valid_folders:
-            logger.info(f"  Removing stale folder: {child}")
-            try:
-                shutil.rmtree(child)
-            except Exception as e:
-                logger.error(f"  Failed to remove {child}: {e}")
+        logger.info(f"  Deleting folder no longer in metadata: {child}")
+        try:
+            shutil.rmtree(child)
+        except Exception as e:
+            logger.error(f"  Failed to delete {child}: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline(sensor=None, only_sensors=None, force=False, field=False):
-    target_sensors = sensor or only_sensors
-    _run_pipeline(force=force, only_sensors=target_sensors, field=field)
+def run_pipeline(sensor=None, force=False, field=False):
+    _run_pipeline(force=force, sensor=sensor, field=field)
 
 
 def main():
@@ -767,35 +620,24 @@ def main():
         raise
 
 
-def _run_pipeline(force=False, only_sensors=None, field=False):
-    # Determine whether field sync is enabled for this run
+def _run_pipeline(force=False, sensor=None, field=False):
     copy_field = field
     if copy_field:
-        if FIELD_PATH is None or not FIELD_PATH.exists():
-            logger.warning("Field sync requested but CRNS_FIELD_DATA_PATH not set or path doesn't exist.")
-            logger.warning("Set environment variable CRNS_FIELD_DATA_PATH to your field data root directory.")
-            copy_field = False
-        else:
-            logger.info(f"Field sync ENABLED (source: {FIELD_PATH})")
+        logger.info(f"Field sync ENABLED (source: {FIELD_PATH})")
     else:
         logger.info("Field sync DISABLED (use --field to enable)")
 
-    if only_sensors:
-        expanded = []
-        for s in only_sensors:
-            expanded.extend([x.strip() for x in s.split("+") if x.strip()])
-        only_sensors = expanded
-        logger.info(f"Filtering to sensors: {only_sensors}")
+    sensor_filter = parse_sensor_filter(sensor)
+    if sensor_filter:
+        logger.info(f"Filtering to sensors: {sorted(sensor_filter)}")
+
+    if not METADATA_FILE.exists():
+        raise FileNotFoundError(f"Could not find {METADATA_FILE}.")
+    if not FTP_SOURCES_FILE.exists():
+        raise FileNotFoundError(f"Could not find {FTP_SOURCES_FILE}. Create ftp_sources.txt with server credentials.")
 
     download_api_data()
     logger.info("--- Syncing FTP and Field Data ---")
-
-    if not METADATA_FILE.exists():
-        logger.error(f"Could not find {METADATA_FILE}.")
-        return
-    if not FTP_SOURCES_FILE.exists():
-        logger.error(f"Could not find {FTP_SOURCES_FILE}. Create ftp_sources.txt with server credentials.")
-        return
 
     sensors = load_sensors_from_excel(METADATA_FILE)
     sources = load_ftp_sources()
@@ -803,7 +645,7 @@ def _run_pipeline(force=False, only_sensors=None, field=False):
 
     try:
         for sensor_key, sensor_data in sensors.items():
-            if only_sensors and sensor_key not in only_sensors:
+            if not sensor_matches(sensor_filter, sensor_key, sensor_data):
                 continue
             if not sensor_data.get("active", False):
                 logger.info(f"Skipping inactive sensor: {sensor_key}")
@@ -837,22 +679,6 @@ def _run_pipeline(force=False, only_sensors=None, field=False):
                 if not phase.get("folder_name"):
                     continue
 
-                # Always sync config YAML into every existing phase subfolder
-                config_filename = phase.get("config_file")
-                if config_filename:
-                    config_src = SENSOR_CONFIG_DIR / config_filename
-                    if config_src.exists():
-                        for subfolder in ["ftp", "sd"]:
-                            dest_dir = sensor_dir / phase["folder_name"] / subfolder
-                            if dest_dir.exists():
-                                sync_local_file(
-                                    config_src,
-                                    dest_dir / Path(config_filename).name,
-                                    cache, force=True,
-                                )
-                    else:
-                        logger.warning(f"Config file '{config_filename}' not found at {config_src}")
-
                 # 2. Field (SD) files (local) — only when field sync is enabled
                 if copy_field:
                     field_files = gather_files_for_phase(
@@ -881,6 +707,11 @@ def _run_pipeline(force=False, only_sensors=None, field=False):
 
             # Remove folders no longer in metadata
             cleanup_stale_phase_folders(sensor_dir, phases)
+
+            # Phase config YAMLs: current config into ftp/ and sd/, stale copies deleted
+            counts = sync_sensor_configs(sensor_key, sensor_data, log_fn=logger.info)
+            if counts["copied"]:
+                logger.info(f"  -> Updated {counts['copied']} config YAML copies")
 
         # Save cache after full run
         save_sync_cache(cache)

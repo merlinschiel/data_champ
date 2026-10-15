@@ -3,26 +3,14 @@ Shared utilities for merging CRNS raw data files.
 Used by auto_append.py and the data hub.
 """
 
-import sys
-import os
-
-# Fix Windows console UTF-8 encoding for Rich / Neptoon unicode characters
-os.environ['PYTHONIOENCODING'] = 'utf-8'
-if hasattr(sys.stdout, 'reconfigure'):
-    try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    except Exception:
-        pass
-if hasattr(sys.stderr, 'reconfigure'):
-    try:
-        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-    except Exception:
-        pass
-
 import copy
+import fnmatch
 import io
+import os
 import re
+import time
 import warnings
+import numpy as np
 import yaml
 import pandas as pd
 from pathlib import Path
@@ -30,14 +18,66 @@ import hashlib
 import json
 import shutil
 
+from sensor_metadata import (
+    LOGGER_SUBFOLDERS,
+    MASTER_CONFIG_DIR,
+    MERGED_DIR,
+    TARGET_DATA_DIR,
+    assign_phase_ids,
+    load_phase_config,
+    phase_info_path,
+    phase_windows,
+    sensor_name,
+    write_phase_info,
+)
+
 
 SKIP_PATTERNS = ('hvr', 'npmdiag', 'status')
 
+# Bump when read_raw_file()/_fix_sdi_column_drop() change how raw files are parsed;
+# this invalidates data/.merged/parsed_cache.
+PARSE_CACHE_VERSION = 2
+# raw_data_parse_options that affect the cached parse result of a file
+PARSE_RELEVANT_OPTIONS = ('column_names', 'separator', 'skip_lines', 'encoding', 'decimal',
+                          'skip_initial_space', 'prefix', 'suffix', 'filename_include_regex',
+                          'filename_exclude_regex')
 
-def _fix_sdi_column_drop(content: str, unique_cols: list, log_fn=None, file_path=None) -> str:
-    """Automatically detects SDI sensor column drops (e.g., PR2 6-to-3, SMT 5-to-3, PR2-4 4-to-3) in raw lines and pads missing columns with -99."""
+# Logger placeholder values that mean "no measurement"; replaced by NaN after parsing.
+MISSING_SENTINELS = (-99,)
+
+
+def replace_missing_sentinels(df: pd.DataFrame, exclude=('Date_Time',)) -> pd.DataFrame:
+    """Replace logger placeholder values (e.g. -99 for missing SDI readings) with NaN."""
+    if df is None or df.empty:
+        return df
+    sentinel_strings = {str(v) for v in MISSING_SENTINELS} | {f"{float(v)}" for v in MISSING_SENTINELS}
+    for col in df.columns:
+        if col in exclude:
+            continue
+        series = df[col]
+        if pd.api.types.is_numeric_dtype(series):
+            mask = series.isin(MISSING_SENTINELS)
+        elif pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            mask = series.astype("string").str.strip().isin(sentinel_strings).fillna(False).astype(bool)
+        else:
+            continue
+        if mask.any():
+            df[col] = series.mask(mask)
+    return df
+
+
+def _normalise_separator(sep):
+    if sep in ('\\t', 't\\'):
+        return '\t'
+    return sep
+
+
+def _fix_sdi_column_drop(content: str, unique_cols: list, sep=None) -> str:
+    """Detect SDI sensor column drops (e.g., PR2 6-to-3, SMT 5-to-3, PR2-4 4-to-3) in raw lines
+    and pad the missing values with empty fields (read as NaN)."""
     if not content or 'sdi' not in content.lower():
         return content
+    sep = _normalise_separator(sep)
 
     # Determine expected value count for each SDI block from unique_cols
     sdi_col_indices = [i for i, col in enumerate(unique_cols)] if unique_cols else []
@@ -62,7 +102,10 @@ def _fix_sdi_column_drop(content: str, unique_cols: list, log_fn=None, file_path
             cleaned_lines.append(line)
             continue
 
-        sep_char = ',' if ',' in line else ('\t' if '\t' in line else None)
+        if sep and len(sep) == 1:
+            sep_char = sep if sep in line else None
+        else:
+            sep_char = ',' if ',' in line else ('\t' if '\t' in line else None)
         if not sep_char:
             cleaned_lines.append(line)
             continue
@@ -91,14 +134,14 @@ def _fix_sdi_column_drop(content: str, unique_cols: list, log_fn=None, file_path
 
                 if actual_count < exp_count:
                     missing = exp_count - actual_count
-                    parts[val_end:val_end] = ['-99'] * missing
+                    parts[val_end:val_end] = [''] * missing
                     line_modified = True
-        elif len(unique_cols) if unique_cols else None:
+        elif unique_cols:
             # Fallback when unique_cols provided but no SDI in unique_cols
             num_expected = len(unique_cols)
             if len(parts) < num_expected:
                 missing = num_expected - len(parts)
-                parts.extend(['-99'] * missing)
+                parts.extend([''] * missing)
                 line_modified = True
 
         if line_modified:
@@ -158,23 +201,19 @@ def determine_master_config(configs):
                     if col_names:
                         col_prefix = sf.get('column_prefix', '')
                         dt_col_prof = sf.get('datetime_column', 'datetime')
-                        for idx, col in enumerate(col_names):
-                            if col == dt_col_prof or (idx == 0 and col.lower() in ('datetime', 'date_time', 'date time(utc)')):
+                        for col in col_names:
+                            if col == dt_col_prof:
                                 continue
                             final_col = f"{col_prefix}_{col}" if col_prefix else col
                             if final_col not in seen:
                                 seen.add(final_col)
                                 master_columns.append(final_col)
 
-        try:
-            ts_data = c['config'].get('time_series_data', {})
-            dt_cols = ts_data['key_column_info']['date_time_columns']
-            dt_col = " ".join(dt_cols)
-            fmt = ts_data['key_column_info'].get('date_time_format')
-            if fmt:
-                dt_format = fmt
-        except (KeyError, IndexError, TypeError):
-            pass
+        kci = c['config']['time_series_data']['key_column_info']
+        dt_cols = kci['date_time_columns']
+        dt_col = " ".join(dt_cols)
+        if kci.get('date_time_format'):
+            dt_format = kci['date_time_format']
 
     # filter out scrap columns
     master_columns = [c for c in master_columns
@@ -182,41 +221,42 @@ def determine_master_config(configs):
 
     return master_columns, dt_cols, dt_col, dt_format, base_config
 
-# find data based on prefix and suffix in yaml file
+# find data files in data_dir (not recursive) using the neptoon 1.2 raw_data_parse_options
+# filters: prefix/suffix are single strings (startswith/endswith, or fnmatch when they hold
+# glob characters), filename_include_regex/filename_exclude_regex use re.search, case-sensitive
 def find_data_files(data_dir: Path, parse_opts: dict):
 
-    prefixes = parse_opts.get('prefix', ['*'])
-    suffixes = parse_opts.get('suffix', [''])
-    if isinstance(prefixes, str):
-        prefixes = [prefixes]
-    if isinstance(suffixes, str):
-        suffixes = [suffixes]
-    n = max(len(prefixes), len(suffixes))
-    if len(prefixes) < n:
-        prefixes.extend(['*'] * (n - len(prefixes)))
-    if len(suffixes) < n:
-        suffixes.extend([''] * (n - len(suffixes)))
+    prefix = parse_opts.get('prefix') or ''
+    suffix = parse_opts.get('suffix') or ''
+    include = parse_opts.get('filename_include_regex') or ''
+    exclude = parse_opts.get('filename_exclude_regex') or ''
+    for key, value in (('prefix', prefix), ('suffix', suffix),
+                       ('filename_include_regex', include), ('filename_exclude_regex', exclude)):
+        if not isinstance(value, str):
+            raise ValueError(f"raw_data_parse_options: {key} must be a single string, got {value!r}")
+    include_pattern = re.compile(include) if include else None
+    exclude_pattern = re.compile(exclude) if exclude else None
 
-    data_files = []
-    for pref, suff in zip(prefixes, suffixes):
-        if suff:
-            found = list(data_dir.glob(f"{pref}{suff}"))
-            if not found and not suff.endswith('*'):
-                found = list(data_dir.glob(f"{pref}{suff}*"))
-            data_files.extend(found)
-        else:
-            found = list(data_dir.glob(f"{pref}*"))
-            data_files.extend(
-                [f for f in found if f.is_file() and f.suffix.lower() != '.yaml'])
+    def _matches(pattern: str, name: str, start: bool) -> bool:
+        if not pattern:
+            return True
+        if any(char in pattern for char in "*?["):
+            return fnmatch.fnmatchcase(name, pattern)
+        return name.startswith(pattern) if start else name.endswith(pattern)
 
-    # Deduplicate while preserving order
-    return list(dict.fromkeys(data_files))
+    return sorted(f for f in data_dir.iterdir()
+                  if f.is_file() and f.suffix.lower() != '.yaml'
+                  and _matches(prefix, f.name, start=True)
+                  and _matches(suffix, f.name, start=False)
+                  and (include_pattern is None or include_pattern.search(f.name))
+                  and not (exclude_pattern and exclude_pattern.search(f.name)))
 
 # read raw files after cleaning
 def read_raw_file(file_path: Path, sep, skip_lines, unique_cols, encoding, decimal, skip_space, log_fn=None):
 
     try:
-        with open(file_path, 'r', encoding=encoding) as raw_file:
+        # errors='replace': a single corrupt byte must not discard the whole file
+        with open(file_path, 'r', encoding=encoding, errors='replace') as raw_file:
             content = raw_file.read()
 
         if '|' in content or sep in ('\t', '\\t'):
@@ -231,7 +271,7 @@ def read_raw_file(file_path: Path, sep, skip_lines, unique_cols, encoding, decim
                 cleaned_lines.append(line)
             content = "".join(cleaned_lines)
 
-        content = _fix_sdi_column_drop(content, unique_cols)
+        content = _fix_sdi_column_drop(content, unique_cols, sep=sep)
         data_input = io.StringIO(content)
 
         with warnings.catch_warnings(record=True) as caught:
@@ -280,19 +320,18 @@ def read_all_config_data(configs, log_fn=None, use_cache=True):
     cache_dirty = False
     
     if use_cache:
+        # Only what changes the raw parse result invalidates the cache (not QA ranges, N0, ...)
         hasher = hashlib.sha256()
-        try:
-            hasher.update(Path(__file__).read_bytes())
-        except Exception:
-            pass
+        hasher.update(f"parser-v{PARSE_CACHE_VERSION}".encode('utf-8'))
+        # pickles are not guaranteed to load across pandas versions
+        hasher.update(pd.__version__.encode('utf-8'))
         for c in configs:
             y_path = c.get('yaml_path')
-            if y_path:
-                try:
-                    hasher.update(str(y_path).encode('utf-8'))
-                    hasher.update(y_path.read_bytes())
-                except Exception:
-                    pass
+            parse_opts = c['config'].get('raw_data_parse_options', {}) or {}
+            hasher.update(str(y_path).encode('utf-8'))
+            hasher.update(json.dumps(
+                {k: parse_opts.get(k) for k in PARSE_RELEVANT_OPTIONS},
+                sort_keys=True, default=str).encode('utf-8'))
         current_config_hash = hasher.hexdigest()[:16]
 
         if cache_index_file.exists():
@@ -335,6 +374,8 @@ def read_all_config_data(configs, log_fn=None, use_cache=True):
         data_files = find_data_files(data_dir, parse_opts)
 
         config_dfs = []
+        dt_failures = {'rows': 0, 'files': 0, 'no_dt_files': 0}
+        parse_messages = []
         for df_path in data_files:
             if any(pat in df_path.name.lower() for pat in SKIP_PATTERNS):
                 continue
@@ -368,7 +409,7 @@ def read_all_config_data(configs, log_fn=None, use_cache=True):
             if df is None:
                 # Cache miss, bypass, or read failure — parse raw file
                 df = read_raw_file(df_path, sep, skip_lines, unique_cols,
-                                   encoding, decimal, skip_space, log_fn)
+                                   encoding, decimal, skip_space, parse_messages.append)
                 if df is not None and use_cache:
                     # Save to cache
                     try:
@@ -391,23 +432,54 @@ def read_all_config_data(configs, log_fn=None, use_cache=True):
                             log_fn(f"  -> Failed to cache parsed DataFrame for {df_path}: {e}")
 
             if df is not None:
+                df = replace_missing_sentinels(df)
+
                 # Resolve and parse datetime column using its config-specific format before appending
-                try:
-                    ts_data = c['config'].get('time_series_data', {})
-                    cfg_dt_cols = ts_data['key_column_info']['date_time_columns']
-                    cfg_dt_col = " ".join(cfg_dt_cols)
-                    cfg_dt_format = ts_data['key_column_info'].get('date_time_format')
-                except (KeyError, IndexError, TypeError):
-                    cfg_dt_cols = ['Date_Time']
-                    cfg_dt_col = 'Date_Time'
-                    cfg_dt_format = None
-                
+                kci = c['config']['time_series_data']['key_column_info']
+                cfg_dt_cols = kci['date_time_columns']
+                cfg_dt_col = " ".join(cfg_dt_cols)
+                cfg_dt_format = kci.get('date_time_format')
+
                 resolved_col = resolve_datetime_column(df, cfg_dt_cols, cfg_dt_col)
                 if resolved_col:
-                    df['Date_Time'] = pd.to_datetime(df[resolved_col], format=cfg_dt_format, errors='coerce', utc=True)
-                
+                    raw_dt = df[resolved_col]
+                    df['Date_Time'] = pd.to_datetime(raw_dt, format=cfg_dt_format, errors='coerce', utc=True)
+                    # values with digits that fail to parse (repeated header lines are ignored)
+                    failed = df['Date_Time'].isna() & raw_dt.astype('string').str.contains(r'\d', regex=True).fillna(False).astype(bool)
+                    if failed.any():
+                        dt_failures['rows'] += int(failed.sum())
+                        dt_failures['files'] += 1
+                        dt_failures.setdefault('example', (df_path.name, raw_dt[failed].iloc[0]))
+                else:
+                    dt_failures['no_dt_files'] += 1
+
                 df['_origin_priority'] = 1 if origin == 'sd' else 2
+                if c.get('phase_id'):
+                    df['_source_phase'] = c['phase_id']
                 config_dfs.append(df)
+
+        where = f"{data_dir.parent.name}/{data_dir.name}"
+        if log_fn and parse_messages:
+            mismatches = [m for m in parse_messages if 'Column mismatch' in m]
+            others = [m for m in parse_messages if 'Column mismatch' not in m]
+            if mismatches:
+                log_fn(f"  -> {where}: {len(mismatches)} file(s) with column-count mismatch "
+                       f"(yaml expects {len(unique_cols)} columns; rows that do not fit are skipped). "
+                       f"First:{mismatches[0].split('Column mismatch in', 1)[-1]}")
+            for message in others[:5]:
+                log_fn(message)
+            if len(others) > 5:
+                log_fn(f"  -> {where}: {len(others) - 5} more read errors")
+        if log_fn and (dt_failures['rows'] or dt_failures['no_dt_files']):
+            if dt_failures['rows']:
+                example_file, example_value = dt_failures['example']
+                has_time_shift = bool(parse_opts.get('time_shift')
+                                      or (c['config'].get('time_series_data') or {}).get('time_shift'))
+                outcome = "re-timed by time_shift if configured to, else dropped" if has_time_shift else "dropped"
+                log_fn(f"  -> {where}: {dt_failures['rows']} rows in {dt_failures['files']} file(s) do not "
+                       f"match date_time_format {cfg_dt_format!r} (e.g. {example_value!r} in {example_file}); {outcome}")
+            if dt_failures['no_dt_files']:
+                log_fn(f"  -> {where}: {dt_failures['no_dt_files']} file(s) without datetime column; skipped")
 
         # Apply time_shift options if defined in config
         time_shift_cfg = parse_opts.get('time_shift') or c['config'].get('time_series_data', {}).get('time_shift')
@@ -514,18 +586,16 @@ def clean_and_deduplicate(merged_df, master_columns, actual_dt_col, dt_format,
     # Parse datetime, filter, dedup
     if dt_col in merged_df.columns:
         if not pd.api.types.is_datetime64_any_dtype(merged_df[dt_col]):
-            parsed = pd.to_datetime(merged_df[dt_col], format=dt_format, errors='coerce', utc=True)
-            if parsed.isna().any():
-                fallback = pd.to_datetime(merged_df[dt_col], format='mixed', errors='coerce', utc=True)
-                parsed = parsed.fillna(fallback)
-            merged_df[dt_col] = parsed
+            merged_df[dt_col] = pd.to_datetime(merged_df[dt_col], format=dt_format, errors='coerce', utc=True)
         merged_df = merged_df.dropna(subset=[dt_col])
 
-        # Filter faulty timestamps (past < 2010 and future > current_year + 1)
-        current_year = pd.Timestamp.now().year
+        # Filter faulty timestamps (before 2010 or more than a day in the future)
+        latest_valid = pd.Timestamp.now(tz='UTC') + pd.Timedelta(days=1)
+        if merged_df[dt_col].dt.tz is None:
+            latest_valid = latest_valid.tz_localize(None)
         merged_df = merged_df[
-            (merged_df[dt_col].dt.year >= 2010) & 
-            (merged_df[dt_col].dt.year <= current_year + 1)
+            (merged_df[dt_col].dt.year >= 2010) &
+            (merged_df[dt_col] <= latest_valid)
         ]
 
         # Optional date range filter
@@ -563,18 +633,13 @@ def clean_and_deduplicate(merged_df, master_columns, actual_dt_col, dt_format,
     exclude_cols.add(actual_dt_col)
     exclude_cols.add('Date_Time')
     exclude_cols.add('_origin_priority')
+    exclude_cols.add('_source_phase')
 
     # Build the final column list
     ordered_cols = ['Date_Time']
     for col in master_columns:
         if col not in exclude_cols and col in merged_df.columns:
             ordered_cols.append(col)
-
-    # If no other columns are found, keep everything excluding raw datetime/priority
-    if len(ordered_cols) == 1:
-        for col in merged_df.columns:
-            if col not in exclude_cols:
-                ordered_cols.append(col)
 
     merged_df = merged_df[[c for c in ordered_cols if c in merged_df.columns]]
 
@@ -633,108 +698,104 @@ def group_configs_by(yaml_configs: dict, property_name: str):
 # Supplementary file processing (secondary detectors, profile data)
 # ---------------------------------------------------------------------------
 
-def _merge_secondary_detector(merged_df, data_dir, parse_opts, sf_config,
-                               dt_col, dt_format, log_fn=None):
-    """Read secondary detector file, sum specified columns into merged_df."""
+def _glob_supplementary(data_dir: Path, prefix: str, suffix: str) -> list:
+    """Find supplementary files matching prefix*suffix."""
+    files = data_dir.glob(re.sub(r'\*+', '*', f"{prefix}*{suffix}"))
+    return [f for f in files if f.is_file() and f.suffix.lower() not in ('.yaml', '.yml')]
+
+
+def _datetime_ns(series: pd.Series) -> pd.Series:
+    """UTC datetimes at ns resolution so merge keys from different frames match."""
+    return pd.to_datetime(series, utc=True).dt.as_unit('ns')
+
+
+def _merge_secondary_detector(merged_df, data_dirs, config, sf_config, log_fn=None):
+    """Sum the configured columns of a secondary detector into the primary columns.
+
+    Files from all data_dirs (ftp + sd of one phase) are combined and de-duplicated by
+    timestamp first, so a record is never added twice. Missing primary values stay
+    missing; timestamps without a secondary record keep the primary value.
+    """
     prefix = sf_config.get('file_prefix') or ''
     suffix = sf_config.get('file_suffix') or ''
-
-    pat1 = f"{prefix}{suffix}"
-    while '**' in pat1:
-        pat1 = pat1.replace('**', '*')
-    files = list(data_dir.glob(pat1))
-    if not files:
-        pat2 = f"{prefix}*{suffix}"
-        while '**' in pat2:
-            pat2 = pat2.replace('**', '*')
-        files = list(data_dir.glob(pat2))
+    files = [f for d in data_dirs for f in _glob_supplementary(d, prefix, suffix)]
     if not files:
         if log_fn:
             log_fn(f"  -> No secondary detector file found: {prefix}*{suffix}")
         return merged_df
+    if 'Date_Time' not in merged_df.columns:
+        return merged_df
 
-    raw_cols = parse_opts.get('column_names', [])
-    unique_cols = make_unique_columns(raw_cols)
+    parse_opts = config.get('raw_data_parse_options', {})
+    unique_cols = make_unique_columns(parse_opts.get('column_names', []))
     sep = parse_opts.get('separator', ',')
     skip_lines = parse_opts.get('skip_lines', 0)
     encoding = parse_opts.get('encoding', 'utf-8')
     decimal = parse_opts.get('decimal', '.')
     skip_space = parse_opts.get('skip_initial_space', True)
+    kci = config['time_series_data']['key_column_info']
+    dt_cols = kci['date_time_columns']
+    dt_format = kci.get('date_time_format')
 
-    # columns to sum from config
     sum_cols = [op['source_column'] for op in sf_config.get('column_operations', [])
                 if op.get('operation') == 'sum']
 
+    frames = []
     for fpath in files:
-        if log_fn:
-            log_fn(f"  -> Processing secondary detector: {fpath.name}")
-
         df_sec = read_raw_file(fpath, sep, skip_lines, unique_cols,
                                encoding, decimal, skip_space, log_fn)
         if df_sec is None or df_sec.empty:
             continue
-
-        # parse datetime in both frames
-        if dt_col not in df_sec.columns or dt_col not in merged_df.columns:
+        df_sec = replace_missing_sentinels(df_sec)
+        sec_dt_col = resolve_datetime_column(df_sec, dt_cols, " ".join(dt_cols))
+        if not sec_dt_col:
+            if log_fn:
+                log_fn(f"  -> No datetime column in secondary detector file {fpath.name}")
             continue
+        df_sec['Date_Time'] = pd.to_datetime(df_sec[sec_dt_col], format=dt_format,
+                                             errors='coerce', utc=True)
+        keep = ['Date_Time'] + [c for c in sum_cols if c in df_sec.columns]
+        frames.append(df_sec[keep].dropna(subset=['Date_Time']))
 
-        df_sec[dt_col] = pd.to_datetime(df_sec[dt_col], format='mixed', errors='coerce', utc=True).dt.tz_localize(None)
-        df_sec = df_sec.dropna(subset=[dt_col])
+    if not frames:
+        return merged_df
 
-        was_string = not pd.api.types.is_datetime64_any_dtype(merged_df[dt_col])
-        if was_string:
-            merged_df[dt_col] = pd.to_datetime(merged_df[dt_col], format='mixed', errors='coerce', utc=True).dt.tz_localize(None)
-        elif hasattr(merged_df[dt_col].dt, 'tz') and merged_df[dt_col].dt.tz is not None:
-            merged_df[dt_col] = merged_df[dt_col].dt.tz_convert('UTC').dt.tz_localize(None)
+    sec = pd.concat(frames, ignore_index=True).drop_duplicates(subset=['Date_Time'], keep='first')
+    sec['Date_Time'] = _datetime_ns(sec['Date_Time'])
+    sec = sec.rename(columns={c: f"_sec_{c}" for c in sum_cols if c in sec.columns})
+    merged_df = merged_df.copy()
+    merged_df['Date_Time'] = _datetime_ns(merged_df['Date_Time'])
+    merged_df = merged_df.merge(sec, on='Date_Time', how='left')
 
-        # keep only datetime + sum columns from secondary
-        keep = [dt_col] + [c for c in sum_cols if c in df_sec.columns]
-        df_sec = df_sec[keep]
+    sec_cols = [c for c in merged_df.columns if c.startswith('_sec_')]
+    matched = int(merged_df[sec_cols].notna().any(axis=1).sum()) if sec_cols else 0
+    for col in sum_cols:
+        sec_name = f"_sec_{col}"
+        if sec_name in merged_df.columns and col in merged_df.columns:
+            primary = pd.to_numeric(merged_df[col], errors='coerce')
+            secondary = pd.to_numeric(merged_df[sec_name], errors='coerce').fillna(0)
+            merged_df[col] = primary + secondary
+    merged_df = merged_df.drop(columns=sec_cols)
 
-        # rename secondary sum columns to avoid clash during merge
-        rename_map = {c: f"_sec_{c}" for c in sum_cols if c in df_sec.columns}
-        df_sec = df_sec.rename(columns=rename_map)
-
-        merged_df = merged_df.merge(df_sec, on=dt_col, how='left')
-
-        # sum primary + secondary, write back to primary column
-        for col in sum_cols:
-            sec_name = f"_sec_{col}"
-            if sec_name in merged_df.columns and col in merged_df.columns:
-                merged_df[col] = (pd.to_numeric(merged_df[col], errors='coerce').fillna(0)
-                                  + pd.to_numeric(merged_df[sec_name], errors='coerce').fillna(0))
-                merged_df = merged_df.drop(columns=[sec_name])
-
-        # convert datetime back to string if it was string before
-        if was_string:
-            merged_df[dt_col] = merged_df[dt_col].dt.strftime('%Y-%m-%d %H:%M:%S')
-
-        if log_fn:
-            log_fn(f"  -> Summed columns {sum_cols} from {fpath.name}")
-
+    if log_fn:
+        log_fn(f"  -> Summed {sum_cols} from {len(files)} secondary detector file(s); "
+               f"{matched} rows had a matching secondary record")
     return merged_df
 
 
-def _merge_profile_data(merged_df, data_dir, sf_config, dt_col, dt_format, log_fn=None):
-    """Read profile or field probe data, resample, and merge using combine_first."""
+def _merge_profile_data(merged_df, data_dir, sf_config, log_fn=None):
+    """Read profile or field probe data, resample, and fill it in by nearest timestamp
+    (10 min tolerance). Existing values in merged_df take precedence."""
     prefix = sf_config.get('file_prefix') or ''
     suffix = sf_config.get('file_suffix') or ''
     sf_type = sf_config.get('type', 'profile_data')
 
-    pat1 = f"{prefix}{suffix}"
-    while '**' in pat1:
-        pat1 = pat1.replace('**', '*')
-    files = list(data_dir.glob(pat1))
-    if not files:
-        pat2 = f"{prefix}*{suffix}"
-        while '**' in pat2:
-            pat2 = pat2.replace('**', '*')
-        files = list(data_dir.glob(pat2))
-    if not files:
+    files = _glob_supplementary(data_dir, prefix, suffix)
+    if not files or 'Date_Time' not in merged_df.columns:
         return merged_df
 
     popts = sf_config.get('parse_options', {})
-    
+
     # Extract values with fallbacks
     if sf_type == 'field_probe_data':
         sep = sf_config.get('separator', '\t')
@@ -761,11 +822,12 @@ def _merge_profile_data(merged_df, data_dir, sf_config, dt_col, dt_format, log_f
         try:
             df_probe = pd.read_csv(
                 fpath,
-                sep=sep,
+                sep=_normalise_separator(sep),
                 skiprows=skip_lines,
                 names=col_names,
                 decimal=decimal,
                 encoding=encoding,
+                encoding_errors='replace',
                 on_bad_lines='skip',
                 engine='python'
             )
@@ -777,22 +839,20 @@ def _merge_profile_data(merged_df, data_dir, sf_config, dt_col, dt_format, log_f
         if df_probe.empty:
             continue
 
-        # Determine datetime column
-        if dt_col_prof in df_probe.columns:
-            actual_dt_col_prof = dt_col_prof
-        elif col_names and col_names[0] in df_probe.columns:
-            actual_dt_col_prof = col_names[0]
-        else:
-            actual_dt_col_prof = df_probe.columns[0]
+        if dt_col_prof not in df_probe.columns:
+            if log_fn:
+                log_fn(f"  -> {fpath.name}: datetime column '{dt_col_prof}' not found; skipped")
+            continue
 
-        df_probe[actual_dt_col_prof] = pd.to_datetime(
-            df_probe[actual_dt_col_prof], format=dt_fmt_prof, errors='coerce', utc=True)
-        df_probe = df_probe.dropna(subset=[actual_dt_col_prof])
-        df_probe = df_probe.set_index(actual_dt_col_prof)
+        df_probe[dt_col_prof] = pd.to_datetime(
+            df_probe[dt_col_prof], format=dt_fmt_prof, errors='coerce', utc=True)
+        df_probe = df_probe.dropna(subset=[dt_col_prof])
+        df_probe = df_probe.set_index(dt_col_prof)
 
         # Force numeric, drop non-numeric
         df_probe = df_probe.apply(pd.to_numeric, errors='coerce')
         df_probe = df_probe.select_dtypes(include='number')
+        df_probe = replace_missing_sentinels(df_probe)
 
         # Add column prefix to avoid clashes between sensors
         if col_prefix:
@@ -805,370 +865,93 @@ def _merge_profile_data(merged_df, data_dir, sf_config, dt_col, dt_format, log_f
             df_probe = df_probe.resample(resample_freq).first()
 
         df_probe = df_probe.dropna(how='all')
-        df_probe = df_probe.reset_index()
-        df_probe = df_probe.rename(columns={actual_dt_col_prof: dt_col})
+        df_probe.index.name = 'Date_Time'
+        probe_dfs.append(df_probe.reset_index())
 
-        probe_dfs.append(df_probe)
+    if not probe_dfs:
+        return merged_df
 
-    if probe_dfs:
-        df_probe_all = pd.concat(probe_dfs, ignore_index=True)
-        # Drop duplicates on datetime column in case files overlap in time
-        df_probe_all = df_probe_all.drop_duplicates(subset=[dt_col])
-        df_probe_all = df_probe_all.set_index(dt_col).sort_index()
+    probe_all = pd.concat(probe_dfs, ignore_index=True)
+    # Drop duplicates in case files overlap in time
+    probe_all = probe_all.drop_duplicates(subset=['Date_Time'])
+    probe_all['Date_Time'] = _datetime_ns(probe_all['Date_Time'])
+    probe_all = probe_all.sort_values('Date_Time')
 
-        # Parse datetime in merged_df if needed
-        was_string = not pd.api.types.is_datetime64_any_dtype(merged_df[dt_col])
-        if was_string:
-            parsed = pd.to_datetime(merged_df[dt_col], format='%Y-%m-%d %H:%M:%S', errors='coerce', utc=True)
-            if parsed.notna().any():
-                merged_df[dt_col] = parsed
-            else:
-                merged_df[dt_col] = pd.to_datetime(merged_df[dt_col], format=dt_format, errors='coerce', utc=True)
+    merged_df = merged_df.reset_index(drop=True)
+    left = pd.DataFrame({'Date_Time': _datetime_ns(merged_df['Date_Time']),
+                         '_row': np.arange(len(merged_df))})
+    left = left.dropna(subset=['Date_Time']).sort_values('Date_Time')
+    aligned = pd.merge_asof(
+        left,
+        probe_all,
+        on='Date_Time',
+        direction='nearest',
+        tolerance=pd.Timedelta('10min'),
+    ).set_index('_row').reindex(np.arange(len(merged_df)))
 
-        merged_df = merged_df.set_index(dt_col).sort_index()
-
-        # Drop NaT in indexes to avoid ValueError in pd.merge_asof
-        df_probe_all = df_probe_all[df_probe_all.index.notna()]
-        merged_df = merged_df[merged_df.index.notna()]
-
-        # Ensure both indexes match timezone (UTC)
-        if hasattr(df_probe_all.index, 'tz') and df_probe_all.index.tz is not None:
-            df_probe_all.index = df_probe_all.index.tz_convert('UTC')
+    for col in probe_all.columns:
+        if col == 'Date_Time':
+            continue
+        if col in merged_df.columns:
+            merged_df[col] = merged_df[col].combine_first(aligned[col])
         else:
-            df_probe_all.index = df_probe_all.index.tz_localize('UTC')
-
-        if hasattr(merged_df.index, 'tz') and merged_df.index.tz is not None:
-            merged_df.index = merged_df.index.tz_convert('UTC')
-        else:
-            merged_df.index = merged_df.index.tz_localize('UTC')
-
-        temp_df = pd.DataFrame(index=merged_df.index)
-        aligned_probe = pd.merge_asof(
-            temp_df,
-            df_probe_all,
-            left_index=True,
-            right_index=True,
-            direction='nearest',
-            tolerance=pd.Timedelta('10min')
-        )
-
-        # Combine
-        merged_df = merged_df.combine_first(aligned_probe)
-        merged_df = merged_df.reset_index()
-
-        if was_string:
-            merged_df[dt_col] = merged_df[dt_col].dt.strftime('%Y-%m-%d %H:%M:%S')
+            merged_df[col] = aligned[col].to_numpy()
 
     return merged_df
-
 
 
 def process_supplementary_files(merged_df, configs, log_fn=None):
     """Process supplementary files defined in YAML configs.
 
     Call after concat, before clean_and_deduplicate.
-    Handles secondary_detector (sum columns) and profile_data (resample + merge).
+    Handles secondary_detector (sum columns) and profile_data/field_probe_data
+    (resample + fill by nearest timestamp).
     """
     processed = set()
+    merged_df = merged_df.reset_index(drop=True)
 
     for c in configs:
         supp_files = c['config'].get('supplementary_files', [])
-        if not supp_files:
+        if not supp_files or not isinstance(supp_files, list):
             continue
 
         data_dir = c['yaml_path'].parent
-        parse_opts = c['config'].get('raw_data_parse_options', {})
-
-        # get datetime info from config
-        try:
-            kci = c['config']['time_series_data']['key_column_info']
-            dt_cols_cfg = kci.get('date_time_columns', ['Date_Time'])
-            dt_format = kci.get('date_time_format')
-        except (KeyError, TypeError):
-            dt_cols_cfg = ['Date_Time']
-            dt_format = None
-        dt_col = " ".join(dt_cols_cfg)
+        phase_dir = data_dir.parent
 
         for sf in supp_files:
-            # resolve data directory — field_probe_data may use a sibling subfolder
-            sf_data_dir = data_dir
+            sf_type = sf.get('type', '')
             data_subfolder = sf.get('data_subfolder')
             if data_subfolder:
-                # go up from yaml dir (ftp/ or sd/) to phase dir, then into subfolder
-                phase_dir = data_dir.parent
-                sf_data_dir = phase_dir / data_subfolder
-                if not sf_data_dir.exists():
-                    if log_fn:
-                        log_fn(f"  -> Subfolder not found: {sf_data_dir}")
-                    continue
+                # field probes live in a sibling subfolder of ftp/ or sd/
+                dirs = [phase_dir / data_subfolder]
+            elif sf_type == 'secondary_detector' and data_dir.name in LOGGER_SUBFOLDERS:
+                # secondary detector files may exist in ftp/ and sd/; read them together once
+                dirs = [phase_dir / sub for sub in LOGGER_SUBFOLDERS]
+            else:
+                dirs = [data_dir]
+            dirs = [d for d in dirs if d.is_dir()]
+            if not dirs:
+                if data_subfolder and log_fn:
+                    log_fn(f"  -> Subfolder not found: {phase_dir / data_subfolder}")
+                continue
 
-            # avoid processing same supplementary file twice (ftp + sd yamls in the same phase)
-            sf_key = (sf.get('file_prefix'), sf.get('type'), str(sf_data_dir.resolve()))
+            # avoid processing the same supplementary files twice (ftp + sd yamls in a phase)
+            sf_key = (sf.get('file_prefix'), sf.get('file_suffix'), sf_type,
+                      tuple(str(d.resolve()) for d in dirs))
             if sf_key in processed:
                 continue
             processed.add(sf_key)
 
-            sf_type = sf.get('type', '')
             if sf_type == 'secondary_detector':
-                merged_df = _merge_secondary_detector(
-                    merged_df, sf_data_dir, parse_opts, sf, dt_col, dt_format, log_fn)
+                merged_df = _merge_secondary_detector(merged_df, dirs, c['config'], sf, log_fn)
             elif sf_type in ('profile_data', 'field_probe_data'):
-                merged_df = _merge_profile_data(
-                    merged_df, sf_data_dir, sf, dt_col, dt_format, log_fn)
-
+                for d in dirs:
+                    merged_df = _merge_profile_data(merged_df, d, sf, log_fn)
 
     return merged_df
 
 
-# ---------------------------------------------------------------------------
-# Neptoon processing helpers
-# ---------------------------------------------------------------------------
-
-def _patch_yaml_for_neptoon(y_path: Path, cfg: dict) -> dict:
-    """Patch a sensor YAML dict so neptoon can ingest it.
-
-    - Sets data_location to the yaml's parent directory
-    - Resolves wildcard prefix/suffix to concrete strings
-    - Returns patched config dict (does NOT mutate original).
-    """
-    import copy as _copy
-    cfg = _copy.deepcopy(cfg)
-
-    parse_opts = cfg.get('raw_data_parse_options', {})
-    if not parse_opts:
-        return cfg
-
-    data_dir = y_path.parent
-
-    # --- prefix / suffix ---
-    pref = parse_opts.get('prefix', '')
-    suff = parse_opts.get('suffix', '')
-    if isinstance(pref, list):
-        pref = pref[0] if pref else ''
-    if isinstance(suff, list):
-        suff = suff[0] if suff else ''
-    pref_str = str(pref)
-    suff_str = str(suff)
-
-    # Resolve wildcards by inspecting actual files
-    if '*' in pref_str or '?' in pref_str:
-        glob_pat = f"{pref_str}*{suff_str}"
-        while '**' in glob_pat:
-            glob_pat = glob_pat.replace('**', '*')
-        try:
-            actual_files = list(data_dir.glob(glob_pat))
-        except Exception:
-            actual_files = []
-        if not actual_files:
-            actual_files = (
-                list(data_dir.glob(f"*{suff_str}")) if suff_str
-                else list(data_dir.glob("*"))
-            )
-        if actual_files:
-            sample_name = actual_files[0].name
-            clean_pref = pref_str.replace('**/*', '').replace('*', '').replace('?', '')
-            if clean_pref and clean_pref.lower() in sample_name.lower():
-                idx = sample_name.lower().find(clean_pref.lower())
-                pref_str = sample_name[:idx + len(clean_pref)]
-            else:
-                pref_str = sample_name[:4]
-        else:
-            pref_str = pref_str.replace('**/*', '').replace('*', '')
-
-    if '*' in suff_str:
-        suff_str = suff_str.replace('*', '')
-
-    parse_opts['prefix'] = pref_str
-    parse_opts['suffix'] = suff_str
-    parse_opts['data_location'] = str(data_dir.resolve())
-
-    return cfg
-
-
-def neptoon_process_phase(yaml_path: Path, config: dict,
-                          process_config_path: Path = None,
-                          log_fn=None) -> pd.DataFrame:
-    """Process single phase folder through neptoon's ProcessWithConfig.
-
-    - Patches sensor config for neptoon compatibility
-    - Writes temp YAML for neptoon ingestion
-    - Runs full pipeline: QA -> corrections -> calibration -> aggregation -> SM
-    - Returns processed DataFrame with neptoon output columns
-
-    Parameters
-    ----------
-    yaml_path : Path
-        Path to the phase sensor YAML.
-    config : dict
-        Parsed YAML config dict.
-    process_config_path : Path, optional
-        Path to shared process config YAML. If None, skips processing.
-    log_fn : callable, optional
-        Logging callback.
-
-    Returns
-    -------
-    pd.DataFrame or None
-    """
-    from neptoon.workflow.process_with_config import ProcessWithConfig
-
-    def log(msg):
-        if log_fn:
-            log_fn(msg)
-
-    patched = _patch_yaml_for_neptoon(yaml_path, config)
-    if patched is None:
-        return None
-
-    temp_y = yaml_path.parent / "_temp_neptoon_cfg.yaml"
-    temp_out = yaml_path.parent / "_neptoon_out"
-    try:
-        # Enable figure creation to avoid neptoon save-step errors, but generate no actual figures.
-        patched.setdefault('figures', {})['create_figures'] = True
-        patched['figures']['make_all_figures'] = False
-        patched['figures']['custom_list'] = []
-
-        # Redirect any neptoon saves to a temp dir that we delete
-        patched.setdefault('data_storage', {})['create_report'] = False
-        patched['data_storage']['save_location'] = str(temp_out)
-        patched['data_storage']['save_folder'] = str(temp_out)
-
-        with open(temp_y, 'w', encoding='utf-8') as f:
-            yaml.dump(patched, f, default_flow_style=False, sort_keys=False)
-
-
-        proc = ProcessWithConfig(
-            path_to_sensor_config=str(temp_y),
-            path_to_process_config=str(process_config_path),
-        )
-
-        # run_full_process may raise on save/figure steps — catch and extract DataFrame directly.
-        try:
-            proc.run_full_process()
-        except Exception as run_err:
-            log(f"  -> Neptoon save/figure step note: {run_err}")
-
-        # Extract DataFrame from data_hub regardless of save errors
-        if proc.data_hub is None or proc.data_hub.crns_data_frame is None:
-            log(f"  -> No data from neptoon for {yaml_path.parent.name}")
-            return None
-
-        df = proc.data_hub.crns_data_frame.copy()
-
-        # Tag origin for dedup (SD has priority)
-        origin = yaml_path.parent.name.lower()
-        df['_origin_priority'] = 1 if origin == 'sd' else 2
-
-        log(f"  -> Neptoon processed {len(df)} rows from {yaml_path.parent.name}")
-        return df
-
-    except Exception as e:
-        log(f"  -> Neptoon error for {yaml_path.parent.name}: {e}")
-        return None
-    finally:
-        if temp_y.exists():
-            try:
-                temp_y.unlink()
-            except Exception:
-                pass
-        
-        import shutil
-        if temp_out.exists():
-            try:
-                shutil.rmtree(temp_out)
-            except Exception:
-                pass
-
-
-
-def concat_processed_phases(phase_dfs: list, log_fn=None) -> pd.DataFrame:
-    """Concat neptoon-processed phase DataFrames, handle overlap dedup.
-
-    SD-origin rows take priority over FTP on duplicate timestamps.
-
-    Parameters
-    ----------
-    phase_dfs : list[pd.DataFrame]
-        DataFrames from neptoon_process_phase(), each with _origin_priority.
-    log_fn : callable, optional
-        Logging callback.
-
-    Returns
-    -------
-    pd.DataFrame
-        Combined timeseries, sorted by time, duplicates removed.
-    """
-    def log(msg):
-        if log_fn:
-            log_fn(msg)
-
-    if not phase_dfs:
-        return pd.DataFrame()
-
-    combined = pd.concat(phase_dfs)
-
-    # Ensure DatetimeIndex
-    if not isinstance(combined.index, pd.DatetimeIndex):
-        for col_name in ('Date_Time', 'date_time'):
-            if col_name in combined.columns:
-                combined[col_name] = pd.to_datetime(combined[col_name], errors='coerce')
-                combined = combined.set_index(col_name)
-                break
-
-    # Drop invalid timestamps
-    combined = combined[combined.index.notna()]
-    combined = combined[combined.index.year >= 2010]
-
-    # Dedup: SD priority (lower number = keep)
-    if '_origin_priority' in combined.columns:
-        combined = combined.sort_values(by=['_origin_priority'])
-        combined = combined[~combined.index.duplicated(keep='first')].sort_index()
-        combined = combined.drop(columns=['_origin_priority'], errors='ignore')
-    else:
-        combined = combined[~combined.index.duplicated(keep='first')].sort_index()
-
-    log(f"  -> Combined: {len(combined)} rows, "
-        f"{combined.index.min()} to {combined.index.max()}")
-
-    return combined
-
-
-def _sync_master_sensor_info(master: dict, configs: list = None):
-    """Update location, coordinates, and elevation in master from the latest YAML config."""
-    if not isinstance(master, dict):
-        return master
-    if 'sensor_info' not in master:
-        master['sensor_info'] = {}
-
-    if configs:
-        def get_sort_key(c):
-            path = c.get('yaml_path')
-            if not path:
-                return (0, "")
-            try:
-                folder_name = path.parent.parent.name
-                is_now = 1 if 'now' in folder_name.lower() else 0
-                parts = folder_name.split('_')
-                start_date = parts[0] if parts else ""
-                return (is_now, start_date)
-            except Exception:
-                return (0, "")
-
-        try:
-            sorted_configs = sorted(configs, key=get_sort_key)
-            latest_c = sorted_configs[-1].get('config', {})
-            latest_si = latest_c.get('sensor_info', {})
-            for field in ['location', 'latitude', 'longitude', 'elevation']:
-                val = latest_si.get(field)
-                if val is not None:
-                    master['sensor_info'][field] = val
-        except Exception:
-            pass
-
-    return master
-
-
-def _build_master_yaml(base_config, master_columns, group_value, configs=None):
+def _build_master_yaml(base_config, master_columns, group_value):
     """Create a synthetic master YAML dict from base config + union columns."""
     master = copy.deepcopy(base_config) if base_config else {}
     master.setdefault('raw_data_parse_options', {})
@@ -1176,14 +959,13 @@ def _build_master_yaml(base_config, master_columns, group_value, configs=None):
     master['raw_data_parse_options']['column_names'] = list(master_columns)
     master['raw_data_parse_options']['prefix'] = f"merged_{group_value}"
     master['raw_data_parse_options']['suffix'] = ".csv"
+    master['raw_data_parse_options']['filename_include_regex'] = f"^{re.escape(f'merged_{group_value}.csv')}$"
+    master['raw_data_parse_options'].pop('filename_exclude_regex', None)
     master['raw_data_parse_options']['data_location'] = "../"
     master['raw_data_parse_options']['separator'] = ","
     master['raw_data_parse_options']['skip_lines'] = 1
     master['raw_data_parse_options']['recursive'] = False
     master['raw_data_parse_options']['encoding'] = 'utf-8'
-
-    # update location, coordinates, and elevation from latest config / location_metadata
-    _sync_master_sensor_info(master, configs)
 
     # update time_series_data settings for master config
     if 'time_series_data' not in master:
@@ -1249,9 +1031,8 @@ def merge_sensor_group(configs, output_dir: Path, group_value: str,
     dt_col = 'Date_Time'
 
     out_file = output_dir / f"merged_{group_value}.csv"
-    merged_df.to_csv(out_file, index=False)
-
     if not merged_df.empty:
+        write_csv_atomic(merged_df, out_file)
         data_start = merged_df[dt_col].min()
         data_end = merged_df[dt_col].max()
         log(f"  -> Created {out_file.name}  ({len(merged_df)} rows, "
@@ -1260,7 +1041,7 @@ def merge_sensor_group(configs, output_dir: Path, group_value: str,
         # Write generated master YAML
         configs_dir = output_dir / "sensor_configs"
         configs_dir.mkdir(parents=True, exist_ok=True)
-        master_yaml = _build_master_yaml(base_config, list(merged_df.columns), group_value, configs=configs)
+        master_yaml = _build_master_yaml(base_config, list(merged_df.columns), group_value)
         dest = configs_dir / f"sensor_{group_value}_master.yaml"
         try:
             with open(dest, 'w', encoding='utf-8') as f:
@@ -1270,7 +1051,9 @@ def merge_sensor_group(configs, output_dir: Path, group_value: str,
         except Exception as e:
             log(f"  -> Failed to write master config: {e}")
     else:
-        log(f"  -> Warning: DataFrame is empty after filtering for '{group_value}'.")
+        log(f"  -> Warning: DataFrame is empty after filtering for '{group_value}'; "
+            f"existing {out_file.name} left unchanged.")
+        return False
 
     return True
 
@@ -1339,6 +1122,225 @@ def merge_by_yaml_property(data_dir, output_dir, group_by,
     success = sum(1 for v in results.values() if v)
     log(f"\nDone — {success}/{len(targets)} merged successfully.\n")
     return results
+
+
+# ---------------------------------------------------------------------------
+# Phase-aware merge driven by sensor_metadata.xlsx (used by auto_append.py)
+# ---------------------------------------------------------------------------
+
+MERGE_STATE_FILE = MASTER_CONFIG_DIR / "merge_state.json"
+
+
+def write_csv_atomic(df: pd.DataFrame, out_file: Path, retries: int = 5) -> None:
+    """Write a CSV via a temp file + rename so readers never see a half-written file."""
+    out_file = Path(out_file)
+    tmp_file = out_file.with_name(f".{out_file.name}.tmp")
+    df.to_csv(tmp_file, index=False)
+    for attempt in range(retries):
+        try:
+            os.replace(tmp_file, out_file)
+            return
+        except PermissionError:
+            # target may be open in another process (e.g. the data hub) on Windows
+            if attempt == retries - 1:
+                break
+            time.sleep(1.0)
+    df.to_csv(out_file, index=False)
+    tmp_file.unlink(missing_ok=True)
+
+
+def _merge_fingerprint(configs: list, windows: list) -> str:
+    """Hash of everything a phase merge depends on (code, configs, phase windows, input files)."""
+    hasher = hashlib.sha256()
+    hasher.update(Path(__file__).read_bytes())
+    hasher.update(pd.__version__.encode('utf-8'))
+    for w in windows:
+        hasher.update(repr((w['phase_id'], str(w['start']), str(w['end']),
+                            w['folder_name'], w['config_file'])).encode('utf-8'))
+    phase_dirs = set()
+    for c in configs:
+        hasher.update(json.dumps(c['config'], sort_keys=True, default=str).encode('utf-8'))
+        phase_dirs.add(c['yaml_path'].parent.parent)
+    for phase_dir in sorted(phase_dirs):
+        for sub in sorted(p for p in phase_dir.iterdir() if p.is_dir()):
+            with os.scandir(sub) as entries:
+                for entry in sorted(entries, key=lambda e: e.name):
+                    if entry.is_file():
+                        st = entry.stat()
+                        hasher.update(f"{sub.name}/{entry.name}|{st.st_size}|{st.st_mtime_ns}".encode('utf-8'))
+    return hasher.hexdigest()[:20]
+
+
+def _load_merge_state() -> dict:
+    try:
+        with open(MERGE_STATE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_merge_state(state: dict) -> None:
+    MASTER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(MERGE_STATE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2)
+
+
+def _log_rows_outside_phases(timestamps: pd.Series, windows: list, log) -> None:
+    """Report records that fall into no phase window (gaps or outside the metadata range)."""
+    if timestamps.empty:
+        return
+    starts = pd.DatetimeIndex([w['start'] for w in windows])
+    ts = pd.to_datetime(timestamps, utc=True)
+    previous = starts.searchsorted(pd.DatetimeIndex(ts), side='right') - 1
+    for prev_idx, group in ts.groupby(previous):
+        if prev_idx < 0:
+            where = f"before {windows[0]['phase_id']} (starts {windows[0]['start']})"
+        else:
+            w = windows[prev_idx]
+            nxt = windows[prev_idx + 1]['phase_id'] if prev_idx + 1 < len(windows) else None
+            where = f"after {w['phase_id']} ended {w['end']}" + (f", before {nxt}" if nxt else "")
+        log(f"  -> {len(group)} rows outside any phase window {where} "
+            f"({group.min()} .. {group.max()}); dropped")
+
+
+def merge_sensor_phases(sensor_key: str, sensor_data: dict, output_dir: Path = MERGED_DIR,
+                        force: bool = False, log_fn=None, warn_fn=None) -> dict | None:
+    """Merge all phases of one metadata sensor into merged_<name>.csv.
+
+    Each phase folder is parsed only with the YAML named in the metadata (stale YAML
+    copies are ignored). Every record gets the 'phase' (phase1..phaseN) whose
+    [start, end) window contains its timestamp; records outside all windows are dropped
+    and reported. On duplicate timestamps, rows from the phase's own folder win, then
+    SD before FTP. Also writes the master YAML (from the latest phase config) and
+    sensor_<name>_phases.json for phase-wise neptoon processing and calibration.
+
+    Returns a summary dict, or None when nothing could be merged.
+    """
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    def warn(msg):
+        (warn_fn or log_fn or (lambda m: None))(msg)
+
+    output_dir = Path(output_dir)
+    windows = phase_windows(sensor_data.get('phase', []), log_fn=warn)
+    name = sensor_name(sensor_key, sensor_data)
+    root_dir = TARGET_DATA_DIR / str(sensor_data.get('root_folder_name') or sensor_key)
+
+    folder_users = {}
+    for w in windows:
+        if w['folder_name']:
+            folder_users.setdefault(w['folder_name'], []).append(w['phase_id'])
+    for folder, phase_ids in folder_users.items():
+        if len(phase_ids) > 1:
+            warn(f"  -> {phase_ids} share Phase_Folder '{folder}'; its files are read with each phase's "
+                 f"config and records are attributed by timestamp. Check the metadata.")
+
+    configs = []
+    for w in windows:
+        if not w['folder_name'] or not w['config_file']:
+            warn(f"  -> {w['phase_id']} has no Phase_Folder/Config in the metadata; skipped")
+            continue
+        cfg = load_phase_config(w['config_file'])
+        if cfg is None:
+            warn(f"  -> {w['phase_id']}: config '{w['config_file']}' not found in sensor_config; skipped")
+            continue
+        cfg_name = str((cfg.get('sensor_info') or {}).get('name'))
+        if cfg_name != name:
+            warn(f"  -> {w['phase_id']}: config '{w['config_file']}' has sensor_info.name "
+                 f"'{cfg_name}', expected '{name}'")
+        for sub in LOGGER_SUBFOLDERS:
+            data_dir = root_dir / w['folder_name'] / sub
+            if data_dir.is_dir():
+                configs.append({
+                    'yaml_path': data_dir / Path(w['config_file']).name,
+                    'config': cfg,
+                    'phase_id': w['phase_id'],
+                })
+
+    if not configs:
+        warn(f"  -> No phase data folders found for sensor '{name}' under {root_dir}")
+        return {'name': name, 'status': 'no_data'}
+
+    out_file = output_dir / f"merged_{name}.csv"
+    fingerprint = _merge_fingerprint(configs, windows)
+    state = _load_merge_state()
+    if (not force and state.get(name) == fingerprint and out_file.exists()
+            and phase_info_path(name).exists()):
+        log(f"  -> Inputs unchanged since last merge; {out_file.name} kept")
+        return {'name': name, 'status': 'unchanged'}
+
+    master_columns, dt_cols, dt_col, dt_format, _ = determine_master_config(configs)
+
+    all_dfs = read_all_config_data(configs, log_fn=warn, use_cache=not force)
+    valid_dfs = [df for df in all_dfs if not df.empty]
+    if not valid_dfs:
+        warn(f"  -> No valid data found to merge for sensor {name}")
+        return None
+    merged_df = pd.concat(valid_dfs, ignore_index=True)
+
+    scrap_cols = [c for c in merged_df.columns if 'scrap_col' in c.lower()]
+    if scrap_cols:
+        merged_df = merged_df.drop(columns=scrap_cols)
+
+    if 'Date_Time' not in merged_df.columns:
+        warn(f"  -> No valid datetime column found for sensor {name}.")
+        return None
+
+    merged_df = process_supplementary_files(merged_df, configs, log_fn=log)
+
+    # Attribute every record to the phase whose time window contains it
+    merged_df['Date_Time'] = pd.to_datetime(merged_df['Date_Time'], utc=True)
+    merged_df['phase'] = assign_phase_ids(merged_df['Date_Time'], windows)
+    outside = merged_df['phase'].isna() & merged_df['Date_Time'].notna()
+    if outside.any():
+        _log_rows_outside_phases(merged_df.loc[outside, 'Date_Time'], windows, warn)
+        merged_df = merged_df[~outside]
+
+    if '_source_phase' in merged_df.columns:
+        foreign = (merged_df['_source_phase'].astype(object) != merged_df['phase'].astype(object)).to_numpy()
+        merged_df['_origin_priority'] = merged_df['_origin_priority'] + np.where(foreign, 10, 0)
+        n_foreign = int(foreign.sum())
+        if n_foreign:
+            log(f"  -> {n_foreign} rows lie outside the window of the phase folder they were found in; "
+                f"attributed to the phase matching their timestamp")
+
+    for col in merged_df.columns:
+        if col not in master_columns and col not in ('_origin_priority', '_source_phase'):
+            master_columns.append(col)
+    master_columns = ['phase'] + [c for c in master_columns if c != 'phase']
+
+    merged_df = clean_and_deduplicate(merged_df, master_columns, 'Date_Time', dt_format, dt_cols=dt_cols)
+
+    if merged_df.empty:
+        warn(f"  -> DataFrame is empty after filtering for {out_file.name}; existing file left unchanged. "
+             f"Check your raw data columns and phase dates.")
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_csv_atomic(merged_df, out_file)
+
+    # Master YAML from the latest phase config (sensor_info, key columns of the current setup)
+    latest_cfg = next(load_phase_config(w['config_file']) for w in reversed(windows)
+                      if load_phase_config(w['config_file']))
+    master_yaml = _build_master_yaml(latest_cfg, list(merged_df.columns), name)
+    MASTER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    dest_yaml = MASTER_CONFIG_DIR / f"sensor_{name}_master.yaml"
+    with open(dest_yaml, 'w', encoding='utf-8') as f:
+        yaml.dump(master_yaml, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    write_phase_info(name, sensor_key, windows)
+
+    state[name] = fingerprint
+    _save_merge_state(state)
+
+    rows_per_phase = merged_df['phase'].value_counts().to_dict()
+    log(f"  -> Created {out_file.name} with {len(merged_df)} rows "
+        f"({merged_df['Date_Time'].min()} to {merged_df['Date_Time'].max()})")
+    log("  -> Rows per phase: " + ", ".join(
+        f"{w['phase_id']}={rows_per_phase.get(w['phase_id'], 0)}" for w in windows))
+    return {'name': name, 'status': 'merged', 'rows': len(merged_df),
+            'master_yaml': dest_yaml.name, 'merged_csv': out_file.name}
 
 
 # ---------------------------------------------------------------------------
@@ -1464,7 +1466,7 @@ def _find_most_recent_yaml_in_timeframe(configs, start_date=None, end_date=None)
     return scored[0]['config']
 
 
-def _build_custom_master_yaml(base_config, selected_columns, output_filename, configs=None):
+def _build_custom_master_yaml(base_config, selected_columns, output_filename):
     """Create master YAML containing only selected columns."""
     master = copy.deepcopy(base_config) if base_config else {}
     master.setdefault('raw_data_parse_options', {})
@@ -1475,14 +1477,13 @@ def _build_custom_master_yaml(base_config, selected_columns, output_filename, co
     stem = Path(output_filename).stem if output_filename else 'custom_merge'
     master['raw_data_parse_options']['prefix'] = stem
     master['raw_data_parse_options']['suffix'] = '.csv'
+    master['raw_data_parse_options']['filename_include_regex'] = f"^{re.escape(stem + '.csv')}$"
+    master['raw_data_parse_options'].pop('filename_exclude_regex', None)
     master['raw_data_parse_options']['data_location'] = '../'
     master['raw_data_parse_options']['separator'] = ','
     master['raw_data_parse_options']['skip_lines'] = 1
     master['raw_data_parse_options']['recursive'] = False
     master['raw_data_parse_options']['encoding'] = 'utf-8'
-
-    # Update location, coordinates, and elevation from latest config / location_metadata
-    _sync_master_sensor_info(master, configs)
 
     # Time series data for master
     if 'time_series_data' not in master:
@@ -1762,7 +1763,7 @@ def custom_merge(data_dir, group_by, selected_values,
         if not fname.endswith('.csv'):
             fname += '.csv'
         out_file = output_dir / fname
-        merged_df.to_csv(out_file, index=False)
+        write_csv_atomic(merged_df, out_file)
 
         dt_col_final = 'Date_Time'
         if not merged_df.empty and dt_col_final in merged_df.columns:
@@ -1774,7 +1775,7 @@ def custom_merge(data_dir, group_by, selected_values,
             cfgs, start_date=start_date, end_date=end_date)
         final_columns = list(merged_df.columns)
         master_yaml = _build_custom_master_yaml(
-            recent_base, final_columns, fname, configs=cfgs)
+            recent_base, final_columns, fname)
 
         configs_dir = output_dir / "sensor_configs"
         configs_dir.mkdir(parents=True, exist_ok=True)

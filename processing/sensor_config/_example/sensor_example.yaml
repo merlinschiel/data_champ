@@ -1,6 +1,9 @@
 # ============================================================================
 # EXAMPLE SENSOR CONFIG Showcasing Special YAML Features
 # ============================================================================
+# The YAMLs are neptoon (>= 1.2) sensor configs. Framework-only keys
+# (sensor_info.location, supplementary_files, raw_data_parse_options.time_shift)
+# are removed automatically before a YAML is handed to neptoon.
 
 config: sensor
 
@@ -22,8 +25,12 @@ sensor_info:
   avg_dry_soil_bulk_density: 1.42
   above_ground_biomass: 2.0
   N0: 3200
+  # Optional: N0 per conversion method; the one matching the process config's
+  # soil_moisture_estimation.method is used instead of N0.
+  # N0_desilets_etal_2010: 3200
+  # N0_koehli_etal_2021: 3350
   beta_coefficient: null
-  mean_pressure: 1013.25
+  mean_pressure: null
   location: ExampleSite
 
 # --------------------------------------------------------------------------
@@ -33,24 +40,24 @@ time_series_data:
   path_to_data: null
   key_column_info:
     epithermal_neutron_columns:
-    - N1
-    - N2                            
-    thermal_neutrons: null
+      - N1
+    thermal_neutrons:               # list of columns, or null if there is no thermal tube
+      - N2
     neutron_count_units: absolute_count
     pressure_columns:
-    - Internal_press
+      - Internal_press
     pressure_units: hectopascals
     pressure_merge_method: priority
     temperature_columns:
-    - Internal_t
+      - Internal_t
     temperature_units: celcius
     temperature_merge_method: priority
     relative_humidity_columns:
-    - Internal_rh
+      - Internal_rh
     relative_humidity_units: percent
     relative_humidity_merge_method: priority
     date_time_columns:
-    - Date_Time
+      - Date_Time
     date_time_format: '%Y/%m/%d %H:%M:%S'
     initial_time_zone: utc
     convert_time_zone_to: utc
@@ -63,23 +70,25 @@ raw_data_parse_options:
   data_location: null
 
   column_names:
-  - RecordNum
-  - Date_Time
-  - Internal_press
-  - Internal_t
-  - Internal_rh
-  - Battery_v
-  - N1
-  - N1ET
-  - N2
-  - N2ET
+    - RecordNum
+    - Date_Time
+    - Internal_press
+    - Internal_t
+    - Internal_rh
+    - Battery_v
+    - N1
+    - N1ET
+    - N2
+    - N2ET
 
-  prefix:
-  - '*Data*'
-  - '*'
-  suffix:
-  - .txt
-  - .00*
+  # Raw file selection (neptoon 1.2): prefix/suffix are single strings
+  # (startswith/endswith, or glob patterns when they contain * ? [ ]);
+  # filename_include_regex / filename_exclude_regex are matched with re.search.
+  # Here: files like *Data*.txt or logger files ending in .00x
+  filename_include_regex: '(?i)data.*\.txt$|\.0\d*$'
+  # prefix: ''
+  # suffix: '.txt'
+  # filename_exclude_regex: ''
 
   encoding: cp850
   skip_lines: 0
@@ -141,10 +150,10 @@ supplementary_files:
     file_prefix: 'SecDet_'
     file_suffix: '.txt'
     column_operations:
-    - source_column: column1
-      operation: sum             
-    - source_column: column2
-      operation: sum
+      - source_column: column1
+        operation: sum
+      - source_column: column2
+        operation: sum
 
 
   # ---- 4b. FIELD PROBE DATA (e.g. external TDR installed nearby) ---------
@@ -157,11 +166,11 @@ supplementary_files:
     datetime_column: 'Date Time(UTC)'
     datetime_format: '%d.%m.%Y %H:%M:%S'
     column_names:
-    - 'Date Time(UTC)'
-    - sm_10cm
-    - sm_30cm
-    - temp_10cm
-    - temp_30cm
+      - 'Date Time(UTC)'
+      - sm_10cm
+      - sm_30cm
+      - temp_10cm
+      - temp_30cm
     separator: "\t"
     decimal: ','
     skip_lines: 2
@@ -180,6 +189,8 @@ input_data_qa:
   temperature:
     flag_range: { min: -40, max: 60 }
 
+# Sensor-specific raw neutron range (cph); count rates differ per sensor, so
+# this lives here and not in the process config.
 neutron_quality_assessment:
   raw_neutrons:
     flag_range: { min: 200, max: 8000 }
@@ -191,13 +202,15 @@ soil_moisture_qa:
 # --------------------------------------------------------------------------
 # 6. CALIBRATION
 # --------------------------------------------------------------------------
+# Sample data is read from data/.calibration/calibration_<sensor>.csv
+# (or --campaign <csv>); key_column_names maps neptoon keys to its columns.
 calibration:
   calibrate: false
   data_format: custom
-  location: processing/calibration/data/calibration_example.csv
+  location: null
   key_column_names:
     date_time: DateTime_utc
-    profile_id: Profile_ID
+    profile_id_column: Profile_ID
     sample_depth: Profile_Depth_cm
     radial_distance_from_sensor: Distance_to_CRNS_m
     gravimetric_soil_moisture: SoilMoisture_g_g
@@ -217,4 +230,4 @@ figures:
   create_figures: true
   make_all_figures: true
   custom_list:
-  - nmdb_incoming_radiation
+    - nmdb_incoming_radiation

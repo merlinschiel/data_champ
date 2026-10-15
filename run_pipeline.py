@@ -1,24 +1,31 @@
 """
 CRNS Processing Pipeline Runner
 ================================
-Runs the full processing pipeline:
+Cross-platform entry point that runs the full processing pipeline:
   1. Data Sync   (copydata.py)     - Syncs FTP data into local data/ tree
   2. Data Merge  (auto_append.py)  - Merges raw files into per-sensor CSVs
-  3. Neptoon Processing (neptoon_pipeline.py) - [optional]
-  4. Dashboard   (recent_performance.py)      - Monitoring dashboard
+  3. Calibration (calibrate_sensor.py)        - [optional]
+  4. Neptoon Processing (neptoon_pipeline.py) - [optional]
+  5. Dashboard   (recent_performance.py)      - Monitoring dashboard
 
 Usage:
   python run_pipeline.py                       # sync + merge + dashboard
   python run_pipeline.py --field               # sync includes field data + merge + dashboard
   python run_pipeline.py --process             # sync + merge + neptoon + dashboard
   python run_pipeline.py --process --sensor x+y  # neptoon only for x and y
+  python run_pipeline.py --calibrate --update-yaml  # calibrate and write N0 to the phase YAMLs
+
+Each step's status in last_run.json is SUCCESS, COMPLETED_WITH_ERRORS (the step ran
+but logged errors) or FAILED (the step raised).
 """
 
 import sys
 import time
 import json
 import logging
+import logging.handlers
 import argparse
+import inspect
 import traceback
 from pathlib import Path
 from datetime import datetime
@@ -32,22 +39,49 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(PROCESSING_DIR))
 
 LOG_FILE = LOG_DIR / "pipeline.log"
+LOG_HISTORY = 7  # previous runs kept as pipeline.log.1 ... pipeline.log.7
+LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE, mode='w', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+
+class ErrorCounter(logging.Handler):
+    """Collects ERROR/CRITICAL records so a step that logs errors is not reported as clean."""
+
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+    def reset(self):
+        self.messages = []
+
+
+def setup_logging() -> ErrorCounter:
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=0, backupCount=LOG_HISTORY, encoding='utf-8', delay=True)
+    if LOG_FILE.exists() and LOG_FILE.stat().st_size > 0:
+        file_handler.doRollover()
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter(LOG_FORMAT))
+    counter = ErrorCounter()
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for handler in (file_handler, console, counter):
+        root.addHandler(handler)
+    return counter
+
+
+error_counter = setup_logging()
 logger = logging.getLogger("pipeline")
 
 
 def run_pipeline():
 
     parser = argparse.ArgumentParser(
-        description="CRNS Data Pipeline: sync, merge, process, dashboard."
+        description="CRNS Data Pipeline — sync, merge, process, dashboard."
     )
     parser.add_argument(
         "--process", action="store_true",
@@ -55,11 +89,15 @@ def run_pipeline():
     )
     parser.add_argument(
         "--calibrate", action="store_true",
-        help="Run sensor calibration step (calculates N0 and updates sensor YAMLs)"
+        help="Run sensor calibration step (calculates optimal N0 per phase)"
+    )
+    parser.add_argument(
+        "--update-yaml", action="store_true",
+        help="With --calibrate: write the calibrated N0 into the YAML of each calibrated phase"
     )
     parser.add_argument(
         "--sensor", "-s", type=str, nargs="+", default=None,
-        help="Process only specific sensor name(s)"
+        help="Process only specific sensor name(s) (applies to all steps)"
     )
     parser.add_argument(
         "--process-config", type=str, default=None,
@@ -71,7 +109,7 @@ def run_pipeline():
     )
     parser.add_argument(
         "--field", action="store_true",
-        help="Enable field/SD card data sync (requires CRNS_FIELD_DATA_PATH)"
+        help="Enable field/SD card data sync (source: parent folder of the project)"
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -92,7 +130,7 @@ def run_pipeline():
     logger.info("=" * 60)
     logger.info("CRNS Data Pipeline started")
     if args.calibrate:
-        logger.info("  -> Sensor calibration ENABLED")
+        logger.info("  -> Sensor calibration ENABLED" + (" (YAML update ON)" if args.update_yaml else ""))
     if args.process:
         logger.info("  -> Neptoon processing ENABLED")
         logger.info(f"  -> Neptoon mode: {'Phase-by-Phase' if args.by_phase else 'Unified Merged'}")
@@ -108,13 +146,13 @@ def run_pipeline():
     for step_name, module_name in steps:
         logger.info(f"--- Step: {step_name} ({module_name}.py) ---")
         start = time.time()
+        error_counter.reset()
 
         try:
             module = __import__(module_name)
 
             # Pass arguments dynamically to modules that support run_pipeline
             if hasattr(module, 'run_pipeline'):
-                import inspect
                 sig = inspect.signature(module.run_pipeline)
                 kwargs = {}
                 if 'sensor' in sig.parameters and args.sensor:
@@ -128,29 +166,33 @@ def run_pipeline():
                 if 'by_phase' in sig.parameters and args.by_phase:
                     kwargs['by_phase'] = args.by_phase
                 if 'update_yaml' in sig.parameters:
-                    kwargs['update_yaml'] = True
+                    kwargs['update_yaml'] = args.update_yaml
                 module.run_pipeline(**kwargs)
             else:
                 module.main()
 
             duration = time.time() - start
-            results.append({
-                "step": step_name,
-                "status": "SUCCESS",
-                "duration_s": round(duration, 2)
-            })
-            logger.info(f"  -> {step_name} completed in {duration:.1f}s")
+            entry = {"step": step_name, "status": "SUCCESS", "duration_s": round(duration, 2)}
+            if error_counter.messages:
+                entry["status"] = "COMPLETED_WITH_ERRORS"
+                entry["error_count"] = len(error_counter.messages)
+                entry["error"] = " | ".join(m.strip().splitlines()[0] for m in error_counter.messages[:5])
+                all_ok = False
+                logger.warning(f"  -> {step_name} completed in {duration:.1f}s with "
+                               f"{len(error_counter.messages)} logged error(s)")
+            else:
+                logger.info(f"  -> {step_name} completed in {duration:.1f}s")
+            results.append(entry)
 
         except Exception as e:
             duration = time.time() - start
-            error_msg = f"{e}\n{traceback.format_exc()}"
             results.append({
                 "step": step_name,
-                "status": f"FAILED",
+                "status": "FAILED",
                 "error": str(e),
                 "duration_s": round(duration, 2)
             })
-            logger.error(f"  -> {step_name} FAILED after {duration:.1f}s: {e}")
+            logger.error(f"  -> {step_name} FAILED after {duration:.1f}s: {e}\n{traceback.format_exc()}")
             all_ok = False
 
     # Write run summary

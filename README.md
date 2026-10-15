@@ -22,20 +22,21 @@ FTP / API / SD Cards
          │
          ▼
 ┌─────────────────────┐
-│  2. auto_append.py  │  Finds all .yaml configs in the data/ tree.
-│    (Data Merge)     │  Parses raw data files according to YAML column mappings.
-│                     │  Produces one merged CSV per sensor in data/.merged/
+│  2. auto_append.py  │  Parses raw files phase by phase with the YAML named
+│    (Data Merge)     │  in the metadata, tags every record with its phase and
+│                     │  writes one merged CSV per sensor to data/.merged/
 └────────┬────────────┘
          │
          ▼
 ┌──────────────────────────┐
-│  3. neptoon_pipeline.py  │  [Optional] Runs neptoon processing:
-│     (Processing)         │  QA → corrections → calibration → soil moisture
+│  3. calibrate_sensor.py  │  [Optional] N0 per phase from soil sample campaigns
+│  4. neptoon_pipeline.py  │  [Optional] neptoon processing:
+│     (Processing)         │  QA → corrections → soil moisture
 └────────┬─────────────────┘
          │
          ▼
 ┌──────────────────────────┐
-│ 4. recent_performance.py │  Reads merged CSVs + YAML configs.
+│ 5. recent_performance.py │  Reads merged CSVs + YAML configs.
 │      (Dashboard)         │  Generates plots and an HTML monitoring dashboard.
 └────────┬─────────────────┘
          │
@@ -53,6 +54,8 @@ FTP / API / SD Cards
 > See [how_to_run.md](how_to_run.md) for detailed setup instructions, including Windows Task Scheduler automation.
 
 ### 1. Install
+
+Requires Python 3.11+ (neptoon ≥ 1.2 needs Python ≥ 3.11 and pandas 3). `uv` picks up the pinned Python 3.12 from `.python-version`.
 
 ```bash
 # Clone the repository
@@ -78,9 +81,11 @@ pip install -e .
 
 3. **Sensor configs** — Create YAML config files in `processing/sensor_config/<sensor_id>/` defining column mappings and parse options (see [YAML Configs](#yaml-sensor-configs)).
 
-4. **HTTP API sources** *(optional)* — Copy `processing/meta/api_sources.txt.example` to `api_sources.txt` and add your API endpoints (e.g. Finapp sensors).
+4. **HTTP API sources** *(optional)* — Edit `processing/meta/api_sources.txt` (it ships with an example row) and add your API endpoints (e.g. Finapp sensors).
 
-5. **Field data** *(optional)* — Set the `CRNS_FIELD_DATA_PATH` environment variable to your local field data root, or add it to a `.env` file (see `.env.example`).
+5. **Field data** *(optional)* — Set the `CRNS_FIELD_DATA_PATH` environment variable to your local field data root. If it is not set, `Field_Folder` patterns are resolved relative to the folder that contains the project.
+
+6. **Calibration data** *(optional)* — Place soil sample campaigns at `data/.calibration/calibration_<sensor>.csv` (see `data/.calibration/calibration_01.csv`).
 
 ### 3. Run
 
@@ -102,15 +107,25 @@ uv run run_pipeline.py
 # With neptoon processing
 uv run run_pipeline.py --process
 
-# Specific sensors only
-uv run run_pipeline.py --sensor 01+02
+# Neptoon with each phase's own YAML instead of the latest one
+uv run run_pipeline.py --process --by-phase
+
+# Calibrate N0 and write it into the calibrated phases' YAMLs
+uv run run_pipeline.py --calibrate --update-yaml
+
+# Specific sensors only (also: --sensor 01+02)
+uv run run_pipeline.py --sensor 01 02
 
 # Enable field/SD card sync
 uv run run_pipeline.py --field
 
+# Bypass sync and merge caches
+uv run run_pipeline.py --force
+
 # Individual steps
 uv run processing/copydata.py
 uv run processing/auto_append.py
+uv run processing/neptoon_pipeline.py --sensor 01
 uv run processing/recent_performance.py
 ```
 
@@ -126,8 +141,11 @@ data_champ/
 │   ├── copydata.py                  # Data sync (FTP + API + field)
 │   ├── auto_append.py               # Merge raw files per sensor
 │   ├── merge_utils.py               # Core merge/parse utilities
-│   ├── calibrate_sensor.py          # Neptoon sensor calibration (N0)
+│   ├── sensor_metadata.py           # Shared metadata access (sensors, phases, paths)
+│   ├── calibrate_sensor.py          # Neptoon sensor calibration (N0 per phase)
 │   ├── neptoon_pipeline.py          # Neptoon processing & corrections
+│   ├── neptoon_utils.py             # Builds neptoon configs from the sensor YAMLs
+│   ├── log_utils.py                 # Shared logging setup
 │   ├── plots_and_reports.py         # Time series plots & PDF reports
 │   ├── recent_performance.py        # HTML monitoring dashboard generator
 │   ├── copy_yamls.py                # Utility: copy YAML configs to data folders
@@ -145,11 +163,12 @@ data_champ/
 │   │       ├── ftp/                 # FTP-sourced files + YAML config
 │   │       └── sd/                  # Field/SD-sourced files (optional)
 │   ├── .merged/                     # Merged CSVs (one per sensor)
+│   │   └── sensor_configs/          # Master YAMLs + phase tables
+│   ├── .calibration/                # Soil sample campaigns (calibration_<sensor>.csv)
 │   └── .processed/                  # Neptoon output (optional)
 ├── handout.pdf                      # Project overview & architectural poster
 ├── how_to_run.md                    # Detailed run instructions & scheduler setup
 ├── how_to_update_metadata.md        # Guide for adding/updating sensor phases
-├── .env.example                     # Environment variable template
 ├── pyproject.toml                   # Python project config
 └── LICENSE                          # MIT License
 ```
@@ -167,13 +186,17 @@ Each sheet represents one sensor. Each row is a **phase** (a period with consist
 | `Active` | `TRUE`/`FALSE` — whether to process this sensor |
 | `Root_Folder` | Target folder name under `data/` |
 | `Phase_Start_Date` | Start date (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`) |
-| `Phase_End_Date` | End date (blank = ongoing) |
+| `Phase_End_Date` | End date (a date without time includes that whole day; blank = until the next phase starts / ongoing) |
 | `Phase_Folder` | Subfolder name for this phase (e.g. `20230101_20230601`) |
 | `Config` | Relative path to YAML config (e.g. `01/sensor_01_10col.yaml`) |
 | `Phase_Location` | Location name |
 | `Phase_Description` | Human-readable description |
 | `FTP_Folder` | Remote FTP directory path |
-| `Field_Folder` | Local field data glob pattern (requires `--field` flag + `CRNS_FIELD_DATA_PATH`) |
+| `Field_Folder` | Local field data glob pattern, relative to `CRNS_FIELD_DATA_PATH` (requires `--field`) |
+
+#### Phases
+
+Phases are numbered chronologically by `Phase_Start_Date` (`phase1`, `phase2`, …) and cover `[Phase_Start_Date, Phase_End_Date)`. During the merge every record is attributed to the phase whose window contains its timestamp and gets that id in the `phase` column. Records outside all phase windows (gaps between phases) are dropped and listed in `auto_append.log`, so gaps in the metadata should be real gaps. Phase-wise neptoon processing (`--by-phase`) and calibration use this column to pick each phase's YAML.
 
 ### FTP Sources (`processing/meta/ftp_sources.txt`)
 
@@ -201,24 +224,28 @@ https://data.finapptech.com/api/get-data/12345/token	data/my_sensor/20240101_now
 
 ## YAML Sensor Configs
 
-Each phase needs a YAML config file in `processing/sensor_config/<sensor_id>/`. This file tells the pipeline how to parse raw data files.
+Each phase needs a YAML config file in `processing/sensor_config/<sensor_id>/`. This file tells the pipeline how to parse raw data files. The merge always reads the YAML named in the metadata's `Config` column; during the sync it is also copied into the phase's `ftp/` and `sd/` folders (other YAMLs found there are deleted).
+
+The YAMLs are also neptoon (≥ 1.2) sensor configs. neptoon rejects unknown keys, so framework-only keys (`sensor_info.location`, `supplementary_files`, `raw_data_parse_options.time_shift`) are removed automatically before a YAML is handed to neptoon.
 
 **Key sections:**
 
 ```yaml
 config: sensor
 sensor_info:
-  name: '01'                    # Must match the sheet name in sensor_metadata.xlsx
+  name: '01'                    # Keep identical for all phases of a sensor
   country: Germany
   latitude: 52.46
   longitude: 12.96
-  elevation: 113
-  N0: 1100                     # Reference neutron count for soil moisture estimation
+  elevation: 36.8
+  N0: 5065                     # Reference neutron count for soil moisture estimation
+  # N0_desilets_etal_2010 / N0_koehli_etal_2021: optional N0 per conversion method
   location: MyLocation
 
 time_series_data:
   key_column_info:
-    epithermal_neutron_columns: [N1, N2]
+    epithermal_neutron_columns: [N1]
+    thermal_neutrons: [N2]      # list of columns, or null
     pressure_columns: [Internal_press]
     temperature_columns: [Internal_t]
     relative_humidity_columns: [Internal_rh]
@@ -227,20 +254,23 @@ time_series_data:
 
 raw_data_parse_options:
   column_names: [RecordNum, Date_Time, Internal_press, ...]
-  prefix: ['*Data*']            # File name patterns to match
-  suffix: [.txt]
+  filename_include_regex: '(?i)data.*\.txt$'   # or single-string prefix / suffix
   encoding: utf-8
   separator: ','
   skip_lines: 0
+
+neutron_quality_assessment:     # sensor-specific raw neutron range (cph)
+  raw_neutrons:
+    flag_range: { min: 200, max: 8000 }
 ```
 
 **Advanced YAML features:**
 
 - **`supplementary_files`** — Merge data from secondary detectors or profile probes (PR2, SMT100)
 - **`time_shift`** — Correct timestamp offsets (`offset`, `align_start`, or `reconstruct_sequence` modes)
-- **`calibration`** — Calibration data settings for neptoon processing
+- **`calibration.key_column_names`** — Column names of the calibration CSV
 
-See the example configs in `processing/sensor_config/01/` for complete examples.
+See `processing/sensor_config/_example/sensor_example.yaml` for all features and `processing/sensor_config/01/` for real configs.
 
 ---
 
@@ -249,8 +279,8 @@ See the example configs in `processing/sensor_config/01/` for complete examples.
 ### CRNS Data Hub (`data_hub.py`)
 Central Streamlit web application providing a full graphical control room:
 - **Dashboard**: High-level system overview, sensor network summary, interactive sensor map (Folium), and status table.
-- **Pipeline Runner**: Run individual steps or full pipeline with custom flags (calibration, processing, sensor filters) and live streamed log output (`st.status`).
-- **Data Explorer**: Interactive multi-parameter time-series plotting with Plotly (secondary Y-axis, date filters, pan/zoom), data inspection, and HTML/PNG export.
+- **Pipeline Runner**: Run individual steps or full pipeline with custom flags (calibration, processing, sensor filters, cache bypass), custom merging, and live streamed log output (`st.status`).
+- **Data Explorer**: Interactive multi-parameter time-series plotting with Plotly (secondary Y-axis, date filters, pan/zoom), box/lasso time selection with CSV export, correlation heatmaps, and HTML/PNG export.
 - **Logs**: Centralized viewer for all component logs.
 
 Launch with:
@@ -259,10 +289,10 @@ uv run streamlit run data_hub.py
 ```
 
 ### Merged Data (`data/.merged/`)
-One CSV per sensor with unified datetime format (`YYYY-MM-DDTHH:MM:SSZ`), `Date_Time` as first column. All phase data concatenated, deduplicated (SD card data takes priority over FTP on timestamp conflicts).
+One CSV per sensor (`merged_<sensor>.csv`) with unified datetime format (`YYYY-MM-DDTHH:MM:SSZ`), `Date_Time` as first column followed by the `phase` column (`phase1` … `phaseN`). All phase data concatenated, deduplicated (SD card data takes priority over FTP on timestamp conflicts). Logger placeholder values (`-99`) are written as empty (NaN). `sensor_configs/` holds the master YAMLs (built from the latest phase's YAML) and phase tables (`sensor_<sensor>_phases.json`).
 
 ### Processed Data (`data/.processed/`)
-Neptoon output with corrections applied: soil moisture (gravimetric & volumetric), corrected neutron counts, measurement depth, and uncertainty estimates.
+Neptoon output (`processed_<sensor>.csv`, with `phase` column) with corrections applied: soil moisture (gravimetric & volumetric), corrected neutron counts, measurement depth, and uncertainty estimates. Also holds figures (`figures/<sensor>/`) and calibration results.
 
 ### Performance Dashboard (`dashboard/`)
 Static HTML dashboard generated by `processing/recent_performance.py` with per-sensor diagnostic plots (neutron counts, pressure, temperature, battery, soil probes) and status indicators (active / warning / stale).
@@ -305,10 +335,14 @@ When changes affect a sensor's data structure, source, sensitivity, or location:
 | File | Script | Description |
 |------|--------|-------------|
 | `processing/meta/logs/copydata.log` | `copydata.py` | Data sync operations |
-| `processing/meta/logs/auto_append.log` | `auto_append.py` | Data merge operations |
-| `processing/meta/logs/pipeline.log` | `run_pipeline.py` | Overall pipeline orchestration |
+| `processing/meta/logs/auto_append.log` | `auto_append.py` | Data merge operations (incl. records outside phase windows) |
 | `processing/meta/logs/neptoon_pipeline.log` | `neptoon_pipeline.py` | Neptoon processing details |
-| `last_run.json` | `run_pipeline.py` | Machine-readable run status |
+| `processing/meta/logs/calibration.log` | `calibrate_sensor.py` | Sensor calibration |
+| `processing/meta/logs/plots_and_reports.log` | `plots_and_reports.py` | Figure/report generation (when run on its own) |
+| `processing/meta/logs/pipeline.log` | `run_pipeline.py` | Overall pipeline orchestration (previous 7 runs kept as `pipeline.log.1` … `.7`) |
+| `last_run.json` | `run_pipeline.py` | Run status per step: `SUCCESS`, `COMPLETED_WITH_ERRORS` or `FAILED` |
+
+Each script's log is rewritten on every run.
 
 ---
 

@@ -4,26 +4,26 @@ sensor_info:
   country: Germany
   identifier: A102
   install_date: 2016-10-21
-  latitude: 52.4664
-  longitude: 12.9592
-  elevation: 40
+  latitude: 52.46639482
+  longitude: 12.95835774
+  elevation: 36.8
   time_zone: 0
-  site_cutoff_rigidity: 2.72
-  avg_lattice_water: 0.0074
-  avg_soil_organic_carbon: 0.0285
-  avg_dry_soil_bulk_density: 1.3949
+  site_cutoff_rigidity: 2.75
+  avg_lattice_water: 0.00773
+  avg_soil_organic_carbon: 0.02342
+  avg_dry_soil_bulk_density: 1.3317
+  N0: 5065
+  beta_coefficient: 0.0073
+  mean_pressure: null
   above_ground_biomass: 0.0
-  N0: 4678
-  beta_coefficient: null
-  mean_pressure: 1013.25
   location: MQ1
 time_series_data:
   path_to_data: null
   key_column_info:
     epithermal_neutron_columns:
     - N1
+    thermal_neutrons:
     - N2
-    thermal_neutrons: null
     neutron_count_units: absolute_count
     pressure_columns:
     - Internal_press
@@ -47,6 +47,7 @@ raw_data_parse_options:
   data_location: ../
   column_names:
   - Date_Time
+  - phase
   - Internal_press
   - N1_cph
   - N2_cph
@@ -58,8 +59,7 @@ raw_data_parse_options:
   - N2ET
   - SMT1_vwc
   - SMT2_vwc
-  prefix: merged_01
-  suffix: .csv
+  filename_include_regex: ^merged_01\.csv$
   encoding: utf-8
   skip_lines: 1
   separator: ','
@@ -72,6 +72,8 @@ raw_data_parse_options:
   multi_header: false
   strip_names: true
   remove_prefix: //
+  prefix: merged_01
+  suffix: .csv
   recursive: false
 input_data_qa:
   air_relative_humidity:
@@ -82,15 +84,6 @@ input_data_qa:
     flag_range:
       min: 600
       max: 1300
-  temperature:
-    flag_range:
-      min: -40
-      max: 60
-neutron_quality_assessment:
-  raw_neutrons:
-    flag_range:
-      min: 500
-      max: 6000
 soil_moisture_qa:
   soil_moisture:
     flag_range:
@@ -99,16 +92,11 @@ soil_moisture_qa:
 calibration:
   calibrate: false
   data_format: custom
-  location: processing/calibration/data/calibration_01.csv
+  location: /path/to/location
   key_column_names:
-    date_time: DateTime_utc
-    profile_id: Profile_ID
-    sample_depth: Profile_Depth_cm
-    radial_distance_from_sensor: Distance_to_CRNS_m
-    gravimetric_soil_moisture: SoilMoisture_g_g
-    bulk_density_of_sample: DryBulkDensity_g_cm3
-    soil_organic_carbon: SoilOrganicCarbon_g_g
-    lattice_water: LatticeWater_g_g
+    profile_id_column: PROF
+    sample_depth: DETPH_AVG
+    radial_distance_from_sensor: LOC_rad
 data_storage:
   save_folder: null
   append_yaml_hash_to_folder_name: false
